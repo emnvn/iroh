@@ -28,9 +28,9 @@ pub const GOSSIP_ALPN: &[u8] = b"/iroh-gossip/0";
 pub const MAX_MESSAGE_SIZE: usize = 1048576;
 
 /// Channel capacity for all subscription broadcast channels (single)
-const SUBSCRIBE_ALL_CAP: usize = 2048;
+const SUBSCRIBE_ALL_CAP: usize = 4096;
 /// Channel capacity for topic subscription broadcast channels (one per topic)
-const SUBSCRIBE_TOPIC_CAP: usize = 2048;
+const SUBSCRIBE_TOPIC_CAP: usize = 4096;
 /// Channel capacity for the send queue (one per connection)
 const SEND_QUEUE_CAP: usize = 64;
 /// Channel capacity for the ToActor message queue (single)
