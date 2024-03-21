@@ -1,5 +1,6 @@
 //! Contains helpers for looking up system network interfaces.
 
+use std::fmt;
 use std::{collections::HashMap, net::IpAddr};
 
 #[cfg(any(
@@ -36,6 +37,16 @@ use self::windows::default_route;
 #[derive(Debug)]
 pub struct Interface {
     iface: default_net::interface::Interface,
+}
+
+impl fmt::Display for Interface {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}. {} {:?} ipv4={:?} ipv6={:?}",
+            self.iface.index, self.iface.name, self.iface.if_type, self.iface.ipv4, self.iface.ipv6
+        )
+    }
 }
 
 impl PartialEq for Interface {
@@ -183,6 +194,27 @@ pub struct State {
     pub pac: Option<String>,
 }
 
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut ifaces: Vec<_> = self.interfaces.values().collect();
+        ifaces.sort_by_key(|iface| iface.iface.index);
+        for iface in ifaces {
+            write!(f, "{iface}")?;
+            if let Some(ref default_if) = self.default_route_interface {
+                if iface.name() == default_if {
+                    write!(f, " (default)")?;
+                }
+            }
+            if f.alternate() {
+                writeln!(f)?;
+            } else {
+                write!(f, "; ")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl State {
     /// Returns the state of all the current machine's network interfaces.
     ///
@@ -240,7 +272,7 @@ impl State {
         let ifname = fake.iface.name.clone();
         Self {
             interfaces: [(ifname.clone(), fake)].into_iter().collect(),
-            have_v6: false,
+            have_v6: true,
             have_v4: true,
             is_expensive: false,
             default_route_interface: Some(ifname),
@@ -282,10 +314,10 @@ impl State {
     }
 }
 
-/// Reports whether ip is a usable IPv4 address which could
-/// conceivably be used to get Internet connectivity. Globally routable and
-/// private IPv4 addresses are always Usable, and link local 169.254.x.x
-/// addresses are in some environments.
+/// Reports whether ip is a usable IPv4 address which should have Internet connectivity.
+///
+/// Globally routable and private IPv4 addresses are always Usable, and link local
+/// 169.254.x.x addresses are in some environments.
 fn is_usable_v4(ip: &IpAddr) -> bool {
     if !ip.is_ipv4() || ip.is_loopback() {
         return false;
@@ -294,15 +326,25 @@ fn is_usable_v4(ip: &IpAddr) -> bool {
     true
 }
 
-/// Reports whether ip is a usable IPv6 address which could
-/// conceivably be used to get Internet connectivity. Globally routable
-/// IPv6 addresses are always Usable, and Unique Local Addresses
+/// Reports whether ip is a usable IPv6 address which should have Internet connectivity.
+///
+/// Globally routable IPv6 addresses are always Usable, and Unique Local Addresses
 /// (fc00::/7) are in some environments used with address translation.
+///
+/// We consider all 2000::/3 addresses to be routable, which is the interpretation of
+/// <https://www.iana.org/assignments/ipv6-unicast-address-assignments/ipv6-unicast-address-assignments.xhtml>
+/// as well.  However this probably includes some addresses which should not be routed,
+/// e.g. documentation addresses.  See also
+/// <https://doc.rust-lang.org/std/net/struct.Ipv6Addr.html#method.is_global> for an
+/// alternative implementation which is both stricter and laxer in some regards.
 fn is_usable_v6(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V6(ip) => {
             // V6 Global1 2000::/3
-            if matches!(ip.segments(), [0x2000, _, _, _, _, _, _, _]) {
+            let mask: u16 = 0b1110_0000_0000_0000;
+            let base: u16 = 0x2000;
+            let segment1 = ip.segments()[0];
+            if (base & mask) == (segment1 & mask) {
                 return true;
             }
 
@@ -383,6 +425,8 @@ impl HomeRouter {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv6Addr;
+
     use super::*;
 
     #[tokio::test]
@@ -397,5 +441,20 @@ mod tests {
     async fn test_likely_home_router() {
         let home_router = HomeRouter::new().expect("missing home router");
         println!("home router: {:#?}", home_router);
+    }
+
+    #[test]
+    fn test_is_usable_v6() {
+        let loopback = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0x1);
+        assert!(!is_usable_v6(&loopback.into()));
+
+        let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0xcbc9, 0x6aff, 0x5b07, 0x4a9e);
+        assert!(!is_usable_v6(&link_local.into()));
+
+        let derp_use1 = Ipv6Addr::new(0x2a01, 0x4ff, 0xf0, 0xc4a1, 0, 0, 0, 0x1);
+        assert!(is_usable_v6(&derp_use1.into()));
+
+        let random_2603 = Ipv6Addr::new(0x2603, 0x3ff, 0xf1, 0xc3aa, 0x1, 0x2, 0x3, 0x1);
+        assert!(is_usable_v6(&random_2603.into()));
     }
 }

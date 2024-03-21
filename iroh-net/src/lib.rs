@@ -13,9 +13,10 @@
 pub mod config;
 pub mod defaults;
 pub mod derp;
+pub mod dialer;
 mod disco;
+pub mod discovery;
 mod dns;
-pub mod key;
 pub mod magic_endpoint;
 pub mod magicsock;
 pub mod metrics;
@@ -30,7 +31,9 @@ pub mod util;
 
 pub use magic_endpoint::{AddrInfo, MagicEndpoint, NodeAddr};
 
-pub use key::PublicKey as NodeId;
+pub use iroh_base::key;
+
+pub use iroh_base::key::NodeId;
 
 #[cfg(test)]
 pub(crate) mod test_utils;

@@ -1,10 +1,14 @@
 //! Checks the network conditions from the current host.
 //!
+//! Netcheck is responsible for finding out the network conditions of the current host, like
+//! whether it is connected to the internet via IPv4 and/or IPv6, what the NAT situation is
+//! etc.
+//!
 //! Based on <https://github.com/tailscale/tailscale/blob/main/net/netcheck/netcheck.go>
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Debug};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _, Result};
@@ -14,8 +18,8 @@ use tokio::sync::{self, mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info_span, trace, warn, Instrument};
-use url::Url;
 
+use crate::derp::DerpUrl;
 use crate::net::ip::to_canonical;
 use crate::net::{IpFamily, UdpSocket};
 use crate::util::CancelOnDrop;
@@ -58,17 +62,24 @@ pub struct Report {
     pub ipv4_can_send: bool,
     /// could bind a socket to ::1
     pub os_has_ipv6: bool,
-    /// an ICMPv4 round trip completed
-    pub icmpv4: bool,
-    /// Whether STUN results depend which STUN server you're talking to (on IPv4).
+    /// An ICMPv4 round trip completed, `None` if not checked.
+    pub icmpv4: Option<bool>,
+    /// An ICMPv6 round trip completed, `None` if not checked.
+    pub icmpv6: Option<bool>,
+    /// Whether STUN results depend on which STUN server you're talking to (on IPv4).
     pub mapping_varies_by_dest_ip: Option<bool>,
+    /// Whether STUN results depend on which STUN server you're talking to (on IPv6).
+    ///
+    /// Note that we don't really expect this to happen and are merely logging this if
+    /// detecting rather than using it.  For now.
+    pub mapping_varies_by_dest_ipv6: Option<bool>,
     /// Whether the router supports communicating between two local devices through the NATted
     /// public IP address (on IPv4).
     pub hair_pinning: Option<bool>,
     /// Probe indicating the presence of port mapping protocols on the LAN.
     pub portmap_probe: Option<portmapper::ProbeOutput>,
     /// `None` for unknown
-    pub preferred_derp: Option<Url>,
+    pub preferred_derp: Option<DerpUrl>,
     /// keyed by DERP Url
     pub derp_latency: DerpLatencies,
     /// keyed by DERP Url
@@ -76,9 +87,9 @@ pub struct Report {
     /// keyed by DERP Url
     pub derp_v6_latency: DerpLatencies,
     /// ip:port of global IPv4
-    pub global_v4: Option<SocketAddr>,
+    pub global_v4: Option<SocketAddrV4>,
     /// `[ip]:port` of global IPv6
-    pub global_v6: Option<SocketAddr>,
+    pub global_v6: Option<SocketAddrV6>,
     /// CaptivePortal is set when we think there's a captive portal that is
     /// intercepting HTTP traffic.
     pub captive_portal: Option<bool>,
@@ -92,7 +103,7 @@ impl fmt::Display for Report {
 
 /// Latencies per DERP node.
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
-pub struct DerpLatencies(BTreeMap<Url, Duration>);
+pub struct DerpLatencies(BTreeMap<DerpUrl, Duration>);
 
 impl DerpLatencies {
     fn new() -> Self {
@@ -100,7 +111,7 @@ impl DerpLatencies {
     }
 
     /// Updates a derp's latency, if it is faster than before.
-    fn update_derp(&mut self, url: Url, latency: Duration) {
+    fn update_derp(&mut self, url: DerpUrl, latency: Duration) {
         let val = self.0.entry(url).or_insert(latency);
         if latency < *val {
             *val = latency;
@@ -128,7 +139,7 @@ impl DerpLatencies {
     }
 
     /// Returns an iterator over all the derps and their latencies.
-    pub fn iter(&self) -> impl Iterator<Item = (&'_ Url, Duration)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (&'_ DerpUrl, Duration)> + '_ {
         self.0.iter().map(|(k, v)| (k, *v))
     }
 
@@ -140,7 +151,7 @@ impl DerpLatencies {
         self.0.is_empty()
     }
 
-    fn get(&self, url: &Url) -> Option<Duration> {
+    fn get(&self, url: &DerpUrl) -> Option<Duration> {
         self.0.get(url).copied()
     }
 }
@@ -314,10 +325,7 @@ pub(crate) enum Message {
         response_tx: oneshot::Sender<Result<Arc<Report>>>,
     },
     /// A report produced by the [`reportgen`] actor.
-    ReportReady {
-        report: Box<Report>,
-        derp_map: DerpMap,
-    },
+    ReportReady { report: Box<Report> },
     /// The [`reportgen`] actor failed to produce a report.
     ReportAborted,
     /// An incoming STUN packet to parse.
@@ -386,10 +394,6 @@ struct Actor {
     reports: Reports,
 
     // Actor configuration.
-    /// Whether the client should try to reach things other than localhost.
-    ///
-    /// This is set to true in tests to avoid probing the local LAN's router, etc.
-    skip_external_network: bool,
     /// The port mapper client, if those are requested.
     ///
     /// The port mapper is responsible for talking to routers via UPnP and the like to try
@@ -417,7 +421,6 @@ impl Actor {
             receiver,
             sender,
             reports: Default::default(),
-            skip_external_network: false,
             port_mapper,
             in_flight_stun_requests: Default::default(),
             current_report_run: None,
@@ -448,8 +451,8 @@ impl Actor {
                 } => {
                     self.handle_run_check(derp_map, stun_sock_v4, stun_sock_v6, response_tx);
                 }
-                Message::ReportReady { report, derp_map } => {
-                    self.handle_report_ready(report, derp_map);
+                Message::ReportReady { report } => {
+                    self.handle_report_ready(report);
                 }
                 Message::ReportAborted => {
                     self.handle_report_aborted();
@@ -519,7 +522,6 @@ impl Actor {
             self.addr(),
             self.reports.last.clone(),
             self.port_mapper.clone(),
-            self.skip_external_network,
             derp_map,
             stun_sock_v4,
             stun_sock_v6,
@@ -532,8 +534,8 @@ impl Actor {
         });
     }
 
-    fn handle_report_ready(&mut self, report: Box<Report>, derp_map: DerpMap) {
-        let report = self.finish_and_store_report(*report, &derp_map);
+    fn handle_report_ready(&mut self, report: Box<Report>) {
+        let report = self.finish_and_store_report(*report);
         self.in_flight_stun_requests.clear();
         if let Some(ReportRun { report_tx, .. }) = self.current_report_run.take() {
             report_tx.send(Ok(report)).ok();
@@ -549,7 +551,7 @@ impl Actor {
 
     /// Handles [`Message::StunPacket`].
     ///
-    /// If there are currently no in-flight stun requests registerd this is dropped,
+    /// If there are currently no in-flight stun requests registered this is dropped,
     /// otherwise forwarded to the probe.
     fn handle_stun_packet(&mut self, pkt: &[u8], src: SocketAddr) {
         trace!(%src, "received STUN packet");
@@ -611,10 +613,9 @@ impl Actor {
         response_tx.send(()).ok();
     }
 
-    fn finish_and_store_report(&mut self, report: Report, dm: &DerpMap) -> Arc<Report> {
+    fn finish_and_store_report(&mut self, report: Report) -> Arc<Report> {
         let report = self.add_report_history_and_set_preferred_derp(report);
-        self.log_concise_report(&report, dm);
-
+        debug!("{report:?}");
         report
     }
 
@@ -657,14 +658,15 @@ impl Actor {
         let mut best_any = Duration::default();
         let mut old_derp_cur_latency = Duration::default();
         {
-            for (url, d) in r.derp_latency.iter() {
+            for (url, duration) in r.derp_latency.iter() {
                 if Some(url) == prev_derp.as_ref() {
-                    old_derp_cur_latency = d;
+                    old_derp_cur_latency = duration;
                 }
-                let best = best_recent.get(url).unwrap();
-                if r.preferred_derp.is_none() || best < best_any {
-                    best_any = best;
-                    r.preferred_derp.replace(url.clone());
+                if let Some(best) = best_recent.get(url) {
+                    if r.preferred_derp.is_none() || best < best_any {
+                        best_any = best;
+                        r.preferred_derp.replace(url.clone());
+                    }
                 }
             }
 
@@ -686,64 +688,6 @@ impl Actor {
 
         r
     }
-
-    fn log_concise_report(&self, r: &Report, dm: &DerpMap) {
-        // Since we are to String the writes are infallible.
-        use std::fmt::Write;
-
-        let mut log = String::with_capacity(256);
-        write!(log, "report: ").ok();
-        write!(log, "udp={}", r.udp).ok();
-        if !r.ipv4 {
-            write!(log, "v v4={}", r.ipv4).ok();
-        }
-        if !r.udp {
-            write!(log, " icmpv4={}", r.icmpv4).ok();
-        }
-
-        write!(log, " v6={}", r.ipv6).ok();
-        if !r.ipv6 {
-            write!(log, " v6os={}", r.os_has_ipv6).ok();
-        }
-        write!(log, " mapvarydest={:?}", r.mapping_varies_by_dest_ip).ok();
-        write!(log, " hair={:?}", r.hair_pinning).ok();
-        if let Some(probe) = &r.portmap_probe {
-            write!(log, " {}", probe).ok();
-        } else {
-            write!(log, " portmap=?").ok();
-        }
-        if let Some(ipp) = r.global_v4 {
-            write!(log, " v4a={ipp}").ok();
-        }
-        if let Some(ipp) = r.global_v6 {
-            write!(log, " v6a={ipp}").ok();
-        }
-        if let Some(c) = r.captive_portal {
-            write!(log, " captiveportal={c}").ok();
-        }
-        write!(log, " derp={:?}", r.preferred_derp).ok();
-        if r.preferred_derp.is_some() {
-            write!(log, " derpdist=").ok();
-            let mut need_comma = false;
-            for rid in dm.urls() {
-                if let Some(d) = r.derp_v4_latency.get(rid) {
-                    if need_comma {
-                        write!(log, ",").ok();
-                    }
-                    write!(log, "{}v4:{}", rid, d.as_millis()).ok();
-                    need_comma = true;
-                }
-                if let Some(d) = r.derp_v6_latency.get(rid) {
-                    if need_comma {
-                        write!(log, ",").ok();
-                    }
-                    write!(log, "{}v6:{}", rid, d.as_millis()).ok();
-                    need_comma = true;
-                }
-            }
-        }
-        debug!("{}", log);
-    }
 }
 
 /// State the netcheck actor needs for an in-progress report generation.
@@ -759,7 +703,7 @@ struct ReportRun {
 
 /// Attempts to bind a local socket to send STUN packets from.
 ///
-/// If successfull this returns the bound socket and will forward STUN responses to the
+/// If successful this returns the bound socket and will forward STUN responses to the
 /// provided *actor_addr*.  The *cancel_token* serves to stop the packet forwarding when the
 /// socket is no longer needed.
 fn bind_local_stun_socket(
@@ -830,6 +774,8 @@ pub(crate) fn os_has_ipv6() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use bytes::BytesMut;
     use tokio::time;
     use tracing::info;
@@ -885,7 +831,7 @@ mod tests {
         let _guard = iroh_test::logging::setup();
 
         let mut client = Client::new(None).context("failed to create netcheck client")?;
-        let url: Url = format!("https://{}", EU_DERP_HOSTNAME).parse().unwrap();
+        let url: DerpUrl = format!("https://{}", EU_DERP_HOSTNAME).parse().unwrap();
 
         let dm = DerpMap::from_nodes([DerpNode {
             url: url.clone(),
@@ -915,7 +861,10 @@ mod tests {
                     "expected key 1 in DERPLatency; got {:?}",
                     r.derp_latency
                 );
-                assert!(r.global_v4.is_some(), "expected globalV4 set");
+                assert!(
+                    r.global_v4.is_some() || r.global_v6.is_some(),
+                    "expected at least one of global_v4 or global_v6"
+                );
                 assert!(r.preferred_derp.is_some());
             } else {
                 eprintln!("missing UDP, probe not returned by network");
@@ -935,7 +884,7 @@ mod tests {
         // the STUN server being blocked will look like from the client's perspective.
         let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
         let stun_addr = blackhole.local_addr()?;
-        let dm = stun::test::derp_map_of_opts([(stun_addr, true)].into_iter());
+        let dm = stun::test::derp_map_of_opts([(stun_addr, false)].into_iter());
 
         // Now create a client and generate a report.
         let mut client = Client::new(None)?;
@@ -946,36 +895,27 @@ mod tests {
 
         // This test wants to ensure that the ICMP part of the probe works when UDP is
         // blocked.  Unfortunately on some systems we simply don't have permissions to
-        // create raw ICMP pings and we'll have to silenty accept this test is useless (if
+        // create raw ICMP pings and we'll have to silently accept this test is useless (if
         // we could, this would be a skip instead).
-        let have_pinger = Pinger::new().is_ok();
-        if !have_pinger {
-            error!("pinger disabled, test effectively skipped");
-        } else {
-            info!("pinger enabled");
-        }
-
-        // This is the test: we will fall back to sending ICMP pings.  These should
-        // succeed when we have a working pinger.
-        // TODO: fix the test on all environments
-        let icmpv4 = r.icmpv4; // have_pinger;
-        dbg!(have_pinger, r.icmpv4);
+        let pinger = Pinger::new();
+        let can_ping = pinger.send(Ipv4Addr::LOCALHOST.into(), b"aa").await.is_ok();
+        let want_icmpv4 = match can_ping {
+            true => Some(true),
+            false => None,
+        };
 
         let want = Report {
-            // The ip_v4_can_send flag gets set differently across platforms.
-            // On Windows this test detects false, while on Linux detects true.
-            // That's not relevant to this test, so just accept what we're given.
-            ipv4_can_send: r.ipv4_can_send,
+            // The ICMP probe sets the can_ping flag.
+            ipv4_can_send: can_ping,
             // OS IPv6 test is irrelevant here, accept whatever the current machine has.
             os_has_ipv6: r.os_has_ipv6,
             // Captive portal test is irrelevant; accept what the current report has.
             captive_portal: r.captive_portal,
-            icmpv4,
+            // If we can ping we expect to have this.
+            icmpv4: want_icmpv4,
             // If we had a pinger, we'll have some latencies filled in and a preferred derp
-            derp_latency: have_pinger
-                .then(|| r.derp_latency.clone())
-                .unwrap_or_default(),
-            preferred_derp: have_pinger
+            derp_latency: can_ping.then(|| r.derp_latency.clone()).unwrap_or_default(),
+            preferred_derp: can_ping
                 .then_some(r.preferred_derp.clone())
                 .unwrap_or_default(),
             ..Default::default()
@@ -988,7 +928,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_add_report_history_set_preferred_derp() -> Result<()> {
-        fn derp_url(i: u16) -> Url {
+        fn derp_url(i: u16) -> DerpUrl {
             format!("http://{i}.com").parse().unwrap()
         }
 
@@ -1015,7 +955,7 @@ mod tests {
             name: &'static str,
             steps: Vec<Step>,
             /// want PreferredDERP on final step
-            want_derp: Option<Url>,
+            want_derp: Option<DerpUrl>,
             // wanted len(c.prev)
             want_prev_len: usize,
         }

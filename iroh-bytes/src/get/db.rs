@@ -1,48 +1,59 @@
 //! Functions that use the iroh-bytes protocol in conjunction with a bao store.
-use std::path::PathBuf;
-use std::time::Duration;
 
-use bytes::Bytes;
-use futures::{future::LocalBoxFuture, FutureExt, StreamExt};
-use iroh_base::{hash::Hash, rpc::RpcError};
+use futures::{Future, StreamExt};
+use iroh_base::hash::Hash;
+use iroh_base::rpc::RpcError;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::RangeSpec;
+use crate::store::BaoBlobSize;
+use crate::store::FallibleProgressBatchWriter;
 use std::io;
 
 use crate::hashseq::parse_hash_seq;
-use crate::store::PossiblyPartialEntry;
+use crate::store::BaoBatchWriter;
+
 use crate::{
+    export::ExportProgress,
     get::{
         self,
+        error::GetError,
         fsm::{AtBlobHeader, AtEndBlob, ConnectedNext, EndBlobNext},
         Stats,
     },
     protocol::{GetRequest, RangeSpecSeq},
-    store::{MapEntry, PartialMap, PartialMapEntry, Store as BaoStore},
+    store::{MapEntry, MapEntryMut, MapMut, Store as BaoStore},
     util::progress::{IdGenerator, ProgressSender},
-    BlobFormat, HashAndFormat, IROH_BLOCK_SIZE,
+    BlobFormat, HashAndFormat,
 };
-use anyhow::Context;
-use bao_tree::io::fsm::OutboardMut;
+use anyhow::anyhow;
 use bao_tree::{ByteNum, ChunkRanges};
-use iroh_io::{AsyncSliceReader, AsyncSliceWriter};
+use iroh_io::AsyncSliceReader;
 use tracing::trace;
 
 /// Get a blob or collection into a store.
 ///
 /// This considers data that is already in the store, and will only request
 /// the remaining data.
-pub async fn get_to_db<D: BaoStore>(
+///
+/// Progress is reported as [`DownloadProgress`] through a [`ProgressSender`]. Note that the
+/// [`DownloadProgress::AllDone`] event is not emitted from here, but left to an upper layer to send,
+/// if desired. The [`DownloadProgress::Export`] variant will also never be sent from this
+/// function.
+pub async fn get_to_db<
+    D: BaoStore,
+    C: FnOnce() -> F,
+    F: Future<Output = anyhow::Result<quinn::Connection>>,
+>(
     db: &D,
-    conn: quinn::Connection,
+    get_conn: C,
     hash_and_format: &HashAndFormat,
     sender: impl ProgressSender<Msg = DownloadProgress> + IdGenerator,
-) -> anyhow::Result<Stats> {
+) -> Result<Stats, GetError> {
     let HashAndFormat { hash, format } = hash_and_format;
     match format {
-        BlobFormat::Raw => get_blob(db, conn, hash, sender).await,
-        BlobFormat::HashSeq => get_hash_seq(db, conn, hash, sender).await,
+        BlobFormat::Raw => get_blob(db, get_conn, hash, sender).await,
+        BlobFormat::HashSeq => get_hash_seq(db, get_conn, hash, sender).await,
     }
 }
 
@@ -50,14 +61,18 @@ pub async fn get_to_db<D: BaoStore>(
 ///
 /// We need to create our own files and handle the case where an outboard
 /// is not needed.
-async fn get_blob<D: BaoStore>(
+async fn get_blob<
+    D: BaoStore,
+    C: FnOnce() -> F,
+    F: Future<Output = anyhow::Result<quinn::Connection>>,
+>(
     db: &D,
-    conn: quinn::Connection,
+    get_conn: C,
     hash: &Hash,
     progress: impl ProgressSender<Msg = DownloadProgress> + IdGenerator,
-) -> anyhow::Result<Stats> {
-    let end = match db.get_possibly_partial(hash) {
-        PossiblyPartialEntry::Complete(entry) => {
+) -> Result<Stats, GetError> {
+    let end = match db.get_mut(hash).await? {
+        Some(entry) if entry.is_complete() => {
             tracing::info!("already got entire blob");
             progress
                 .send(DownloadProgress::FoundLocal {
@@ -69,7 +84,7 @@ async fn get_blob<D: BaoStore>(
                 .await?;
             return Ok(Stats::default());
         }
-        PossiblyPartialEntry::Partial(entry) => {
+        Some(entry) => {
             trace!("got partial data for {}", hash);
             let valid_ranges = valid_ranges::<D>(&entry)
                 .await
@@ -87,12 +102,13 @@ async fn get_blob<D: BaoStore>(
 
             let request = GetRequest::new(*hash, RangeSpecSeq::from_ranges([required_ranges]));
             // full request
+            let conn = get_conn().await.map_err(GetError::Io)?;
             let request = get::fsm::start(conn, request);
             // create a new bidi stream
             let connected = request.next().await?;
             // next step. we have requested a single hash, so this must be StartRoot
             let ConnectedNext::StartRoot(start) = connected.next().await? else {
-                anyhow::bail!("expected StartRoot");
+                return Err(GetError::NoncompliantNode(anyhow!("expected StartRoot")));
             };
             // move to the header
             let header = start.next();
@@ -100,14 +116,15 @@ async fn get_blob<D: BaoStore>(
 
             get_blob_inner_partial(db, header, entry, progress).await?
         }
-        PossiblyPartialEntry::NotFound => {
+        None => {
             // full request
+            let conn = get_conn().await.map_err(GetError::Io)?;
             let request = get::fsm::start(conn, GetRequest::single(*hash));
             // create a new bidi stream
             let connected = request.next().await?;
             // next step. we have requested a single hash, so this must be StartRoot
             let ConnectedNext::StartRoot(start) = connected.next().await? else {
-                anyhow::bail!("expected StartRoot");
+                return Err(GetError::NoncompliantNode(anyhow!("expected StartRoot")));
             };
             // move to the header
             let header = start.next();
@@ -118,15 +135,15 @@ async fn get_blob<D: BaoStore>(
 
     // we have requested a single hash, so we must be at closing
     let EndBlobNext::Closing(end) = end.next() else {
-        anyhow::bail!("expected Closing");
+        return Err(GetError::NoncompliantNode(anyhow!("expected StartRoot")));
     };
     // this closes the bidi stream. Do something with the stats?
     let stats = end.next().await?;
-    anyhow::Ok(stats)
+    Ok(stats)
 }
 
 /// Given a partial entry, get the valid ranges.
-pub async fn valid_ranges<D: PartialMap>(entry: &D::PartialEntry) -> anyhow::Result<ChunkRanges> {
+pub async fn valid_ranges<D: MapMut>(entry: &D::EntryMut) -> anyhow::Result<ChunkRanges> {
     use tracing::trace as log;
     // compute the valid range from just looking at the data file
     let mut data_reader = entry.data_reader().await?;
@@ -149,20 +166,16 @@ async fn get_blob_inner<D: BaoStore>(
     db: &D,
     at_header: AtBlobHeader,
     sender: impl ProgressSender<Msg = DownloadProgress> + IdGenerator,
-) -> anyhow::Result<AtEndBlob> {
-    // read the size
+) -> Result<AtEndBlob, GetError> {
+    // read the size. The size we get here is not verified, but since we use
+    // it for the tree traversal we are guaranteed not to get more than size.
     let (at_content, size) = at_header.next().await?;
     let hash = at_content.hash();
     let child_offset = at_content.offset();
-    // create the temp file pair
-    let entry = db.get_or_create_partial(hash, size)?;
+    // get or create the partial entry
+    let entry = db.get_or_create(hash, size).await?;
     // open the data file in any case
-    let df = entry.data_writer().await?;
-    let mut of: Option<D::OutboardMut> = if needs_outboard(size) {
-        Some(entry.outboard_mut().await?)
-    } else {
-        None
-    };
+    let bw = entry.batch_writer().await?;
     // allocate a new id for progress reports for this transfer
     let id = sender.new_id();
     sender
@@ -185,25 +198,16 @@ async fn get_blob_inner<D: BaoStore>(
             })?;
         Ok(())
     };
-    let mut pw = ProgressSliceWriter2::new(df, on_write);
-    // use the convenience method to write all to the two vfs objects
-    let end = at_content
-        .write_all_with_outboard(of.as_mut(), &mut pw)
-        .await?;
-    // sync the data file
-    pw.sync().await?;
-    // sync the outboard file, if we wrote one
-    if let Some(mut of) = of {
-        of.sync().await?;
-    }
+    let mut bw = FallibleProgressBatchWriter::new(bw, on_write);
+    // use the convenience method to write all to the batch writer
+    let end = at_content.write_all_batch(&mut bw).await?;
+    // sync the underlying storage, if needed
+    bw.sync().await?;
+    drop(bw);
     db.insert_complete(entry).await?;
     // notify that we are done
     sender.send(DownloadProgress::Done { id }).await?;
     Ok(end)
-}
-
-fn needs_outboard(size: u64) -> bool {
-    size > (IROH_BLOCK_SIZE.bytes() as u64)
 }
 
 /// Get a blob that was requested partially.
@@ -213,21 +217,14 @@ fn needs_outboard(size: u64) -> bool {
 async fn get_blob_inner_partial<D: BaoStore>(
     db: &D,
     at_header: AtBlobHeader,
-    entry: D::PartialEntry,
+    entry: D::EntryMut,
     sender: impl ProgressSender<Msg = DownloadProgress> + IdGenerator,
-) -> anyhow::Result<AtEndBlob> {
-    // TODO: the data we get is validated at this point, but we need to check
-    // that it actually contains the requested ranges. Or DO WE?
-
-    // read the size
+) -> Result<AtEndBlob, GetError> {
+    // read the size. The size we get here is not verified, but since we use
+    // it for the tree traversal we are guaranteed not to get more than size.
     let (at_content, size) = at_header.next().await?;
-    // open the data file in any case
-    let df = entry.data_writer().await?;
-    let mut of = if needs_outboard(size) {
-        Some(entry.outboard_mut().await?)
-    } else {
-        None
-    };
+    // create a batch writer for the bao file
+    let bw = entry.batch_writer().await?;
     // allocate a new id for progress reports for this transfer
     let id = sender.new_id();
     let hash = at_content.hash();
@@ -252,19 +249,16 @@ async fn get_blob_inner_partial<D: BaoStore>(
             })?;
         Ok(())
     };
-    let mut pw = ProgressSliceWriter2::new(df, on_write);
-    // use the convenience method to write all to the two vfs objects
-    let at_end = at_content
-        .write_all_with_outboard(of.as_mut(), &mut pw)
-        .await?;
-    // sync the data file
-    pw.sync().await?;
-    // sync the outboard file
-    if let Some(mut of) = of {
-        of.sync().await?;
-    }
-    // actually store the data. it is up to the db to decide if it wants to
-    // rename the files or not.
+    let mut bw = FallibleProgressBatchWriter::new(bw, on_write);
+    // use the convenience method to write all to the batch writer
+    let at_end = at_content.write_all_batch(&mut bw).await?;
+    // sync the underlying storage, if needed
+    bw.sync().await?;
+    drop(bw);
+    // we got to the end without error, so we can mark the entry as complete
+    //
+    // caution: this assumes that the request filled all the gaps in our local
+    // data. We can't re-check this here since that would be very expensive.
     db.insert_complete(entry).await?;
     // notify that we are done
     sender.send(DownloadProgress::Done { id }).await?;
@@ -275,8 +269,11 @@ async fn get_blob_inner_partial<D: BaoStore>(
 ///
 /// This will compute the valid ranges for partial blobs, so it is somewhat expensive for those.
 pub async fn blob_info<D: BaoStore>(db: &D, hash: &Hash) -> io::Result<BlobInfo<D>> {
-    io::Result::Ok(match db.get_possibly_partial(hash) {
-        PossiblyPartialEntry::Partial(entry) => {
+    io::Result::Ok(match db.get_mut(hash).await? {
+        Some(entry) if entry.is_complete() => BlobInfo::Complete {
+            size: entry.size().value(),
+        },
+        Some(entry) => {
             let valid_ranges = valid_ranges::<D>(&entry)
                 .await
                 .ok()
@@ -286,8 +283,7 @@ pub async fn blob_info<D: BaoStore>(db: &D, hash: &Hash) -> io::Result<BlobInfo<
                 valid_ranges,
             }
         }
-        PossiblyPartialEntry::Complete(entry) => BlobInfo::Complete { size: entry.size() },
-        PossiblyPartialEntry::NotFound => BlobInfo::Missing,
+        None => BlobInfo::Missing,
     })
 }
 
@@ -300,15 +296,19 @@ async fn blob_infos<D: BaoStore>(db: &D, hash_seq: &[Hash]) -> io::Result<Vec<Bl
 }
 
 /// Get a sequence of hashes
-async fn get_hash_seq<D: BaoStore>(
+async fn get_hash_seq<
+    D: BaoStore,
+    C: FnOnce() -> F,
+    F: Future<Output = anyhow::Result<quinn::Connection>>,
+>(
     db: &D,
-    conn: quinn::Connection,
+    get_conn: C,
     root_hash: &Hash,
     sender: impl ProgressSender<Msg = DownloadProgress> + IdGenerator,
-) -> anyhow::Result<Stats> {
+) -> Result<Stats, GetError> {
     use tracing::info as log;
-    let finishing =
-        if let PossiblyPartialEntry::Complete(entry) = db.get_possibly_partial(root_hash) {
+    let finishing = match db.get_mut(root_hash).await? {
+        Some(entry) if entry.is_complete() => {
             log!("already got collection - doing partial download");
             // send info that we have the hashseq itself entirely
             sender
@@ -321,7 +321,9 @@ async fn get_hash_seq<D: BaoStore>(
                 .await?;
             // got the collection
             let reader = entry.data_reader().await?;
-            let (mut hash_seq, children) = parse_hash_seq(reader).await?;
+            let (mut hash_seq, children) = parse_hash_seq(reader).await.map_err(|err| {
+                GetError::NoncompliantNode(anyhow!("Failed to parse downloaded HashSeq: {err}"))
+            })?;
             sender
                 .send(DownloadProgress::FoundHashSeq {
                     hash: *root_hash,
@@ -359,13 +361,14 @@ async fn get_hash_seq<D: BaoStore>(
                 .collect::<Vec<_>>();
             log!("requesting chunks {:?}", missing_iter);
             let request = GetRequest::new(*root_hash, RangeSpecSeq::from_ranges(missing_iter));
+            let conn = get_conn().await.map_err(GetError::Io)?;
             let request = get::fsm::start(conn, request);
             // create a new bidi stream
             let connected = request.next().await?;
             log!("connected");
             // we have not requested the root, so this must be StartChild
             let ConnectedNext::StartChild(start) = connected.next().await? else {
-                anyhow::bail!("expected StartChild");
+                return Err(GetError::NoncompliantNode(anyhow!("expected StartChild")));
             };
             let mut next = EndBlobNext::MoreChildren(start);
             // read all the children
@@ -374,8 +377,8 @@ async fn get_hash_seq<D: BaoStore>(
                     EndBlobNext::MoreChildren(start) => start,
                     EndBlobNext::Closing(finish) => break finish,
                 };
-                let child_offset =
-                    usize::try_from(start.child_offset()).context("child offset too large")?;
+                let child_offset = usize::try_from(start.child_offset())
+                    .map_err(|_| GetError::NoncompliantNode(anyhow!("child offset too large")))?;
                 let (child_hash, info) =
                     match (children.get(child_offset), missing_info.get(child_offset)) {
                         (Some(blob), Some(info)) => (*blob, info),
@@ -392,28 +395,39 @@ async fn get_hash_seq<D: BaoStore>(
                     BlobInfo::Partial { entry, .. } => {
                         get_blob_inner_partial(db, header, entry.clone(), sender.clone()).await?
                     }
-                    BlobInfo::Complete { .. } => anyhow::bail!("got data we have not requested"),
+                    BlobInfo::Complete { .. } => {
+                        return Err(GetError::NoncompliantNode(anyhow!(
+                            "got data we have not requested"
+                        )));
+                    }
                 };
                 next = end_blob.next();
             }
-        } else {
+        }
+        _ => {
             tracing::info!("don't have collection - doing full download");
             // don't have the collection, so probably got nothing
+            let conn = get_conn().await.map_err(GetError::Io)?;
             let request = get::fsm::start(conn, GetRequest::all(*root_hash));
             // create a new bidi stream
             let connected = request.next().await?;
             // next step. we have requested a single hash, so this must be StartRoot
             let ConnectedNext::StartRoot(start) = connected.next().await? else {
-                anyhow::bail!("expected StartRoot");
+                return Err(GetError::NoncompliantNode(anyhow!("expected StartRoot")));
             };
             // move to the header
             let header = start.next();
             // read the blob and add it to the database
             let end_root = get_blob_inner(db, header, sender.clone()).await?;
             // read the collection fully for now
-            let entry = db.get(root_hash).context("just downloaded")?;
+            let entry = db
+                .get(root_hash)
+                .await?
+                .ok_or_else(|| GetError::LocalFailure(anyhow!("just downloaded but not in db")))?;
             let reader = entry.data_reader().await?;
-            let (mut collection, count) = parse_hash_seq(reader).await?;
+            let (mut collection, count) = parse_hash_seq(reader).await.map_err(|err| {
+                GetError::NoncompliantNode(anyhow!("Failed to parse downloaded HashSeq: {err}"))
+            })?;
             sender
                 .send(DownloadProgress::FoundHashSeq {
                     hash: *root_hash,
@@ -431,8 +445,9 @@ async fn get_hash_seq<D: BaoStore>(
                     EndBlobNext::MoreChildren(start) => start,
                     EndBlobNext::Closing(finish) => break finish,
                 };
-                let child_offset =
-                    usize::try_from(start.child_offset()).context("child offset too large")?;
+                let child_offset = usize::try_from(start.child_offset())
+                    .map_err(|_| GetError::NoncompliantNode(anyhow!("child offset too large")))?;
+
                 let child_hash = match children.get(child_offset) {
                     Some(blob) => *blob,
                     None => break start.finish(),
@@ -441,10 +456,11 @@ async fn get_hash_seq<D: BaoStore>(
                 let end_blob = get_blob_inner(db, header, sender.clone()).await?;
                 next = end_blob.next();
             }
-        };
+        }
+    };
     // this closes the bidi stream. Do something with the stats?
     let stats = finishing.next().await?;
-    anyhow::Ok(stats)
+    Ok(stats)
 }
 
 /// Information about a the status of a blob in a store.
@@ -458,7 +474,7 @@ pub enum BlobInfo<D: BaoStore> {
     /// we have the blob partially
     Partial {
         /// The partial entry.
-        entry: D::PartialEntry,
+        entry: D::EntryMut,
         /// The ranges that are available locally.
         valid_ranges: ChunkRanges,
     },
@@ -468,9 +484,9 @@ pub enum BlobInfo<D: BaoStore> {
 
 impl<D: BaoStore> BlobInfo<D> {
     /// The size of the blob, if known.
-    pub fn size(&self) -> Option<u64> {
+    pub fn size(&self) -> Option<BaoBlobSize> {
         match self {
-            BlobInfo::Complete { size } => Some(*size),
+            BlobInfo::Complete { size } => Some(BaoBlobSize::Verified(*size)),
             BlobInfo::Partial { entry, .. } => Some(entry.size()),
             BlobInfo::Missing => None,
         }
@@ -502,7 +518,7 @@ impl<D: BaoStore> BlobInfo<D> {
 }
 
 /// Progress updates for the get operation.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DownloadProgress {
     /// Data was found locally.
     FoundLocal {
@@ -511,7 +527,7 @@ pub enum DownloadProgress {
         /// The hash of the entry.
         hash: Hash,
         /// The size of the entry in bytes.
-        size: u64,
+        size: BaoBlobSize,
         /// The ranges that are available locally.
         valid_ranges: RangeSpec,
     },
@@ -547,80 +563,26 @@ pub enum DownloadProgress {
         /// The unique id of the entry.
         id: u64,
     },
-    /// We are done with the network part - all data is local.
-    NetworkDone {
-        /// The number of bytes written.
-        bytes_written: u64,
-        /// The number of bytes read.
-        bytes_read: u64,
-        /// The time it took to transfer the data.
-        elapsed: Duration,
-    },
-    /// The download part is done for this id, we are now exporting the data
-    /// to the specified out path.
-    Export {
-        /// Unique id of the entry.
-        id: u64,
-        /// The hash of the entry.
-        hash: Hash,
-        /// The size of the entry in bytes.
-        size: u64,
-        /// The path to the file where the data is exported.
-        target: PathBuf,
-    },
-    /// We have made progress exporting the data.
+    /// All network operations finished
+    NetworkDone(Stats),
+    /// If a download is to be exported to the local filesyste, this will report the export
+    /// progress.
+    Export(ExportProgress),
+    /// All operations finished.
     ///
-    /// This is only sent for large blobs.
-    ExportProgress {
-        /// Unique id of the entry that is being exported.
-        id: u64,
-        /// The offset of the progress, in bytes.
-        offset: u64,
-    },
-    /// We got an error and need to abort.
-    Abort(RpcError),
-    /// We are done with the whole operation.
+    /// This will be the last message in the stream.
     AllDone,
+    /// We got an error and need to abort.
+    ///
+    /// This will be the last message in the stream.
+    Abort(RpcError),
 }
 
-/// A slice writer that adds a synchronous progress callback
-#[derive(Debug)]
-struct ProgressSliceWriter2<W, F>(W, F);
-
-impl<W: AsyncSliceWriter, F: Fn(u64, usize) -> io::Result<()> + 'static>
-    ProgressSliceWriter2<W, F>
-{
-    /// Create a new `ProgressSliceWriter` from an inner writer and a progress callback
-    pub fn new(inner: W, on_write: F) -> Self {
-        Self(inner, on_write)
-    }
-}
-
-impl<W: AsyncSliceWriter + 'static, F: Fn(u64, usize) -> io::Result<()> + 'static> AsyncSliceWriter
-    for ProgressSliceWriter2<W, F>
-{
-    type WriteBytesAtFuture<'a> = LocalBoxFuture<'a, io::Result<()>>;
-    fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> Self::WriteBytesAtFuture<'_> {
-        // todo: get rid of the boxing
-        async move {
-            (self.1)(offset, data.len())?;
-            self.0.write_bytes_at(offset, data).await
+impl From<ExportProgress> for DownloadProgress {
+    fn from(value: ExportProgress) -> Self {
+        match value {
+            ExportProgress::Abort(err) => Self::Abort(err),
+            value => Self::Export(value),
         }
-        .boxed_local()
-    }
-
-    type WriteAtFuture<'a> = W::WriteAtFuture<'a>;
-    fn write_at<'a>(&'a mut self, offset: u64, bytes: &'a [u8]) -> Self::WriteAtFuture<'a> {
-        self.0.write_at(offset, bytes)
-    }
-
-    type SyncFuture<'a> = W::SyncFuture<'a>;
-    fn sync(&mut self) -> Self::SyncFuture<'_> {
-        self.0.sync()
-    }
-
-    type SetLenFuture<'a> = W::SetLenFuture<'a>;
-    fn set_len(&mut self, size: u64) -> Self::SetLenFuture<'_> {
-        self.0.set_len(size)
     }
 }

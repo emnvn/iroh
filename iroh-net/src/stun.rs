@@ -13,7 +13,7 @@ pub use stun_rs::{
 
 use crate::net::ip::to_canonical;
 
-/// Errors that can occurr when handling a STUN packet.
+/// Errors that can occur when handling a STUN packet.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The STUN message could not be parsed or is otherwise invalid.
@@ -91,8 +91,12 @@ pub fn parse_binding_request(b: &[u8]) -> Result<TransactionId, Error> {
 
     // TODO: Tailscale sets the software to tailscale, we should check if we want to do this too.
 
-    let attrs = msg.attributes();
-    if attrs.is_empty() || !attrs.last().unwrap().is_fingerprint() {
+    if msg
+        .attributes()
+        .last()
+        .map(|attr| !attr.is_fingerprint())
+        .unwrap_or_default()
+    {
         return Err(Error::NoFingerprint);
     }
 
@@ -153,7 +157,7 @@ pub mod test {
     };
 
     use crate::{
-        derp::{DerpMap, DerpNode},
+        derp::{DerpMap, DerpNode, DerpUrl},
         test_utils::CleanupDropGuard,
     };
 
@@ -164,7 +168,6 @@ pub mod test {
         sync::{oneshot, Mutex},
     };
     use tracing::{debug, trace};
-    use url::Url;
 
     // (read_ipv4, read_ipv5)
     #[derive(Debug, Default, Clone)]
@@ -186,9 +189,9 @@ pub mod test {
             let host = addr.ip();
             let port = addr.port();
 
-            let url: Url = format!("http://{host}:{port}").parse().unwrap();
+            let url: DerpUrl = format!("http://{host}:{port}").parse().unwrap();
             DerpNode {
-                url: url.clone(),
+                url,
                 stun_port: port,
                 stun_only,
             }
@@ -281,7 +284,7 @@ mod tests {
     // async fn test_stun_server() {
     //     use tokio::net::UdpSocket;
     //     use std::sync::Arc;
-    //     use trust_dns_resolver::TokioAsyncResolver;
+    //     use hickory_resolver::TokioAsyncResolver;
 
     //     let domain = "cert-test.iroh.computer";
     //     let port = 3478;

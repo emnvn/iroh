@@ -108,12 +108,12 @@ impl RouteMonitor {
                                 .unwrap_or_default();
                             if let Some(dst) = get_nla!(msg, route::Nla::Destination) {
                                 let dst_addr = match dst.len() {
-                                    4 => Some(IpAddr::from(
-                                        TryInto::<[u8; 4]>::try_into(&dst[..]).unwrap(),
-                                    )),
-                                    16 => Some(IpAddr::from(
-                                        TryInto::<[u8; 16]>::try_into(&dst[..]).unwrap(),
-                                    )),
+                                    4 => TryInto::<[u8; 4]>::try_into(&dst[..])
+                                        .ok()
+                                        .map(IpAddr::from),
+                                    16 => TryInto::<[u8; 16]>::try_into(&dst[..])
+                                        .ok()
+                                        .map(IpAddr::from),
                                     _ => None,
                                 };
                                 if let Some(dst_addr) = dst_addr {
@@ -143,7 +143,7 @@ impl RouteMonitor {
                             // ignored atm
                         }
                         msg => {
-                            trace!("unhandeled: {:?}", msg);
+                            trace!("unhandled: {:?}", msg);
                         }
                     },
                     _ => {

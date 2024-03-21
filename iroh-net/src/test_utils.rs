@@ -3,16 +3,18 @@
 use anyhow::Result;
 use tokio::sync::oneshot;
 use tracing::{error_span, info_span, Instrument};
-use url::Url;
 
-use crate::derp::{DerpMap, DerpNode};
+use crate::derp::{DerpMap, DerpNode, DerpUrl};
 use crate::key::SecretKey;
 
 /// A drop guard to clean up test infrastructure.
 ///
 /// After dropping the test infrastructure will asynchronously shutdown and release its
 /// resources.
+// Nightly sees the sender as dead code currently, but we only rely on Drop of the
+// sender.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct CleanupDropGuard(pub(crate) oneshot::Sender<()>);
 
 /// Runs a  DERP server with STUN enabled suitable for tests.
@@ -21,9 +23,7 @@ pub(crate) struct CleanupDropGuard(pub(crate) oneshot::Sender<()>);
 /// is always `Some` as that is how the [`MagicEndpoint::connect`] API expects it.
 ///
 /// [`MagicEndpoint::connect`]: crate::magic_endpoint::MagicEndpoint
-pub(crate) async fn run_derper() -> Result<(DerpMap, Url, CleanupDropGuard)> {
-    // TODO: pass a mesh_key?
-
+pub(crate) async fn run_derper() -> Result<(DerpMap, DerpUrl, CleanupDropGuard)> {
     let server_key = SecretKey::generate();
     let me = server_key.public().fmt_short();
     let tls_config = crate::derp::http::make_tls_config();
@@ -38,7 +38,7 @@ pub(crate) async fn run_derper() -> Result<(DerpMap, Url, CleanupDropGuard)> {
     println!("DERP listening on {:?}", https_addr);
 
     let (stun_addr, _, stun_drop_guard) = crate::stun::test::serve(server.addr().ip()).await?;
-    let url: Url = format!("https://localhost:{}", https_addr.port())
+    let url: DerpUrl = format!("https://localhost:{}", https_addr.port())
         .parse()
         .unwrap();
     let m = DerpMap::from_nodes([DerpNode {

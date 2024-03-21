@@ -2,181 +2,31 @@ name: CI
 
 on:
   pull_request:
+    types: [ 'labeled', 'unlabeled', 'opened', 'synchronize', 'reopened' ]
   merge_group:
   push:
     branches:
       - main
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   RUST_BACKTRACE: 1
   RUSTFLAGS: -Dwarnings
   RUSTDOCFLAGS: -Dwarnings
-  MSRV: "1.72"
-  CRATES_LIST: "iroh,iroh-bytes,iroh-gossip,iroh-metrics,iroh-net,iroh-sync,iroh-test"
+  MSRV: "1.75"
   SCCACHE_CACHE_SIZE: "50G"
 
 jobs:
-  build_and_test_nix:
-    timeout-minutes: 30
-    name: "Tests"
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        name: [ubuntu-latest, macOS-arm-latest]
-        rust: [nightly, stable]
-        features: [all, none, default]
-        include:
-          - name: ubuntu-latest
-            os: ubuntu-latest
-            release-os: linux
-            release-arch: amd64
-            runner: [self-hosted, linux, X64]
-          - name: macOS-arm-latest
-            os: macOS-latest
-            release-os: darwin
-            release-arch: aarch64
-            runner: [self-hosted, macOS, ARM64]
-    env:
-      # Using self-hosted runners so use local cache for sccache and
-      # not SCCACHE_GHA_ENABLED.
-      RUSTC_WRAPPER: "sccache"
-    steps:
-    - name: Checkout
-      uses: actions/checkout@master
-      with:
-        submodules: recursive
-
-    - name: Install ${{ matrix.rust }}
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ matrix.rust }}
-
-    - name: Install cargo-nextest
-      uses: taiki-e/install-action@v2
-      with:
-        tool: nextest
-    
-    - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.3
-
-    - name: Select features
-      run: |
-        case "${{ matrix.features }}" in
-            all)
-                echo "FEATURES=--all-features" >> "$GITHUB_ENV"
-                ;;
-            none)
-                echo "FEATURES=--no-default-features" >> "$GITHUB_ENV"
-                ;;
-            default)
-                echo "FEATURES=" >> "$GITHUB_ENV"
-                ;;
-            *)
-                exit 1
-        esac
-
-    - name: check features
-      run: |
-        for i in ${CRATES_LIST//,/ }
-        do
-          echo "Checking $i $FEATURES"
-          cargo check -p $i $FEATURES --lib --bins
-        done
-      env:
-        RUST_LOG: ${{ runner.debug && 'DEBUG' || 'INFO'}}
-
-    - name: tests
-      run: |
-        cargo nextest run --workspace ${{ env.FEATURES }} --lib --bins --tests
-      env:
-        RUST_LOG: "TRACE"
-
-    - name: doctests
-      if: ${{ matrix.features == 'all' }}
-      run: |
-        if [ -n "${{ runner.debug }}" ]; then
-            export RUST_LOG=DEBUG
-        fi
-        cargo test --workspace --all-features --doc
-
-  build_and_test_windows:
-    timeout-minutes: 30
-    name: "Tests"
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        name: [windows-latest]
-        rust: [nightly, stable]
-        features: [all, none, default]
-        target:
-          - x86_64-pc-windows-msvc
-        include:
-          - name: windows-latest
-            os: windows
-            runner: [self-hosted, windows, x64]
-    env:
-      # Using self-hosted runners so use local cache for sccache and
-      # not SCCACHE_GHA_ENABLED.
-      RUSTC_WRAPPER: "sccache"
-    steps:
-    - name: Checkout
-      uses: actions/checkout@master
-      with:
-        submodules: recursive
-
-    - name: Install ${{ matrix.rust }}
-      run: |
-        rustup toolchain install ${{ matrix.rust }}
-        rustup toolchain default ${{ matrix.rust }}
-        rustup target add ${{ matrix.target }}
-        rustup set default-host ${{ matrix.target }}
-
-    - name: Install cargo-nextest
-      shell: powershell
-      run: |
-        $tmp = New-TemporaryFile | Rename-Item -NewName { $_ -replace 'tmp$', 'zip' } -PassThru
-        Invoke-WebRequest -OutFile $tmp https://get.nexte.st/latest/windows
-        $outputDir = if ($Env:CARGO_HOME) { Join-Path $Env:CARGO_HOME "bin" } else { "~/.cargo/bin" }
-        $tmp | Expand-Archive -DestinationPath $outputDir -Force
-        $tmp | Remove-Item
-
-    - name: Select features
-      run: |
-        switch ("${{ matrix.features }}") {
-            "all" {
-                echo "FEATURES=--all-features" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
-            }
-            "none" {
-                echo "FEATURES=--no-default-features" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
-            }
-            "default" {
-                echo "FEATURES=" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
-            }
-            default {
-                Exit 1
-            }
-        }
-
-    # TODO: disabled while we do not have Powershell 7+ on the runner
-    # as default shell. See https://github.com/actions/toolkit/issues/1179
-    - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.3
-
-    - uses: msys2/setup-msys2@v2
-
-    - name: tests
-      run: |
-        cargo nextest run --workspace ${{ env.FEATURES }} --lib --bins --tests --target ${{ matrix.target }}
-      env:
-        RUST_LOG: "TRACE"
+  tests:
+    name: CI Test Suite
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    uses: './.github/workflows/tests.yaml'
 
   cross:
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
     name: Cross compile
     runs-on: [self-hosted, linux, X64]
@@ -189,7 +39,7 @@ jobs:
           - aarch64-linux-android
     steps:
     - name: Checkout
-      uses: actions/checkout@master
+      uses: actions/checkout@v4
       with:
         submodules: recursive
 
@@ -212,7 +62,7 @@ jobs:
       if: matrix.target != 'i686-unknown-linux-gnu'
       run: cross build --all --target ${{ matrix.target }}
       env:
-        RUST_LOG: ${{ runner.debug && 'DEBUG' || 'INFO'}}
+        RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG'}}
 
     - name: test
       # cross tests are currently broken vor armv7 and aarch64
@@ -220,7 +70,7 @@ jobs:
       if: matrix.target == 'i686-unknown-linux-gnu'
       run: cross test --all --target ${{ matrix.target }} -- --test-threads=12
       env:
-        RUST_LOG: ${{ runner.debug && 'DEBUG' || 'INFO'}}
+        RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG' }}
 
   check_fmt_and_docs:
     timeout-minutes: 30
@@ -230,14 +80,14 @@ jobs:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
     steps:
-    - uses: actions/checkout@master
+    - uses: actions/checkout@v4
 
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt
 
     - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.3
+      uses: mozilla-actions/sccache-action@v0.0.4
 
     - name: fmt
       run: cargo fmt --all -- --check
@@ -252,18 +102,13 @@ jobs:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
     steps:
-    - uses: actions/checkout@master
-    # Can be switched back to stable once 1.75 lands
-    # https://github.com/rust-lang/cargo/issues/12115#issuecomment-1768170381
-    - uses: dtolnay/rust-toolchain@master
-      with:
-          toolchain: nightly-2023-12-06
-          components: clippy
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
     - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.3
+      uses: mozilla-actions/sccache-action@v0.0.4
 
     # TODO: We have a bunch of platform-dependent code so should
-    #    probably run this job on the full platofrm matrix
+    #    probably run this job on the full platform matrix
     - name: clippy check (all features)
       run: cargo clippy --workspace --all-features --all-targets --bins --tests --benches
 
@@ -274,6 +119,7 @@ jobs:
       run: cargo clippy --workspace --all-targets
 
   msrv:
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
     name: Minimal Supported Rust Version
     runs-on: ubuntu-latest
@@ -281,23 +127,23 @@ jobs:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
     steps:
-    - uses: actions/checkout@master
+    - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ env.MSRV }}
     - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.3
+      uses: mozilla-actions/sccache-action@v0.0.4
 
     - name: Check MSRV all features
       run: |
-        cargo +$MSRV check --workspace --all-targets --features cli
+        cargo +$MSRV check --workspace --all-targets
 
   cargo_deny:
     timeout-minutes: 30
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v1
         with:
           arguments: --workspace --all-features
@@ -305,6 +151,7 @@ jobs:
           command-arguments: "-Dwarnings"
 
   netsim-integration-tests:
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
     name: Run network simulations/benchmarks
     runs-on: [self-hosted, linux, X64]
@@ -314,15 +161,15 @@ jobs:
       RUSTC_WRAPPER: "sccache"
     steps:
     - name: Checkout
-      uses: actions/checkout@master
+      uses: actions/checkout@v4
       with:
         submodules: recursive
-    
+
     - name: Install rust stable
       uses: dtolnay/rust-toolchain@stable
 
     - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.3
+      uses: mozilla-actions/sccache-action@v0.0.4
 
     - name: Build iroh
       run: |
@@ -335,7 +182,7 @@ jobs:
         git clone https://github.com/n0-computer/chuck.git
         cd chuck
         cargo build --release
-    
+
     - name: Install netsim deps
       run: |
         cd ../chuck/netsim
@@ -361,17 +208,17 @@ jobs:
         sudo kill -9 $(pgrep iroh) || true
         sudo kill -9 $(pgrep ovs) || true
         sudo mn --clean || true
-        
-    - name: Setup Environment (PR)  
-      if: ${{ github.event_name == 'pull_request' }}  
-      shell: bash  
-      run: |  
+
+    - name: Setup Environment (PR)
+      if: ${{ github.event_name == 'pull_request' }}
+      shell: bash
+      run: |
         echo "LAST_COMMIT_SHA=$(git rev-parse --short ${{ github.event.pull_request.head.sha }})" >> ${GITHUB_ENV}
         echo "HEAD_REF=${{ github.event.pull_request.head.ref }}" >> ${GITHUB_ENV}
-    - name: Setup Environment (Push)  
-      if: ${{ github.event_name == 'push' || github.event_name == 'merge_group' }}  
-      shell: bash  
-      run: |  
+    - name: Setup Environment (Push)
+      if: ${{ github.event_name == 'push' || github.event_name == 'merge_group' }}
+      shell: bash
+      run: |
         echo "LAST_COMMIT_SHA=$(git rev-parse --short ${GITHUB_SHA})" >> ${GITHUB_ENV}
         echo "HEAD_REF=${{ github.head_ref }}" >> ${GITHUB_ENV}
 
@@ -388,7 +235,7 @@ jobs:
         export AWS_ACCESS_KEY_ID=${{secrets.S3_ACCESS_KEY_ID}}
         export AWS_SECRET_ACCESS_KEY=${{secrets.S3_ACCESS_KEY}}
         export AWS_DEFAULT_REGION=us-west-2
-        
+
         curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
         unzip -q awscliv2.zip
         sudo ./aws/install --update
@@ -399,16 +246,12 @@ jobs:
         tar cvzf report.tar.gz report_prom.txt report_metro.txt report_metro_integration.txt logs/ report/ viz/
         aws s3 cp ./report.tar.gz s3://${{secrets.S3_REPORT_BUCKET}}/$aws_fname --no-progress
 
-        link_data='dump{fname="'$aws_fname'",commit="'${{ env.LAST_COMMIT_SHA }}'",branch="'${{ env.HEAD_REF }}'"} 1.0'
-        link_data=$(printf "%s\n " "$link_data")
-        curl -X POST -H  "Content-Type: text/plain" --data "$link_data" ${{secrets.PROM_ENDPOINT}}/metrics/job/netsim/instance/${instance}
-
     - name: Echo metrics
       run: |
         cd ../chuck/netsim
         d=$(cat report_metro.txt)
         metro_data=$(printf "%s\n " "$d")
-        echo "$metro_data" 
+        echo "$metro_data"
         d=$(cat report_metro_integration.txt)
         metro_data=$(printf "%s\n " "$d")
-        echo "$metro_data" 
+        echo "$metro_data"

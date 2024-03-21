@@ -1,8 +1,10 @@
 //! Utilities for reporting progress.
 //!
 //! The main entry point is the [ProgressSender] trait.
-use futures::{FutureExt, TryFutureExt};
-use std::marker::PhantomData;
+use bytes::Bytes;
+use futures::Future;
+use iroh_io::AsyncSliceWriter;
+use std::{io, marker::PhantomData};
 
 /// A general purpose progress sender. This should be usable for reporting progress
 /// from both blocking and non-blocking contexts.
@@ -85,28 +87,21 @@ pub trait ProgressSender: std::fmt::Debug + Clone + Send + Sync + 'static {
     ///
     type Msg: Send + Sync + 'static;
 
-    ///
-    type SendFuture<'a>: futures::Future<Output = std::result::Result<(), ProgressSendError>>
-        + Send
-        + 'a
-    where
-        Self: 'a;
-
     /// Send a message and wait if the receiver is full.
     ///
     /// Use this to send important progress messages where delivery must be guaranteed.
     #[must_use]
-    fn send(&self, msg: Self::Msg) -> Self::SendFuture<'_>;
+    fn send(&self, msg: Self::Msg) -> impl Future<Output = ProgressSendResult<()>> + Send;
 
     /// Try to send a message and drop it if the receiver is full.
     ///
     /// Use this to send progress messages where delivery is not important, e.g. a self contained progress message.
-    fn try_send(&self, msg: Self::Msg) -> std::result::Result<(), ProgressSendError>;
+    fn try_send(&self, msg: Self::Msg) -> ProgressSendResult<()>;
 
     /// Send a message and block if the receiver is full.
     ///
     /// Use this to send important progress messages where delivery must be guaranteed.
-    fn blocking_send(&self, msg: Self::Msg) -> std::result::Result<(), ProgressSendError>;
+    fn blocking_send(&self, msg: Self::Msg) -> ProgressSendResult<()>;
 
     /// Transform the message type by mapping to the type of this sender.
     fn with_map<U: Send + Sync + 'static, F: Fn(U) -> Self::Msg + Send + Sync + Clone + 'static>(
@@ -125,6 +120,34 @@ pub trait ProgressSender: std::fmt::Debug + Clone + Send + Sync + 'static {
         f: F,
     ) -> WithFilterMap<Self, U, F> {
         WithFilterMap(self, f, PhantomData)
+    }
+}
+
+impl<T: ProgressSender> ProgressSender for Option<T> {
+    type Msg = T::Msg;
+
+    async fn send(&self, msg: Self::Msg) -> ProgressSendResult<()> {
+        if let Some(inner) = self {
+            inner.send(msg).await
+        } else {
+            Ok(())
+        }
+    }
+
+    fn try_send(&self, msg: Self::Msg) -> ProgressSendResult<()> {
+        if let Some(inner) = self {
+            inner.try_send(msg)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn blocking_send(&self, msg: Self::Msg) -> ProgressSendResult<()> {
+        if let Some(inner) = self {
+            inner.blocking_send(msg)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -158,10 +181,8 @@ impl<T> std::fmt::Debug for IgnoreProgressSender<T> {
 impl<T: Send + Sync + 'static> ProgressSender for IgnoreProgressSender<T> {
     type Msg = T;
 
-    type SendFuture<'a> = futures::future::Ready<std::result::Result<(), ProgressSendError>>;
-
-    fn send(&self, _msg: T) -> Self::SendFuture<'_> {
-        futures::future::ready(Ok(()))
+    async fn send(&self, _msg: T) -> std::result::Result<(), ProgressSendError> {
+        Ok(())
     }
 
     fn try_send(&self, _msg: T) -> std::result::Result<(), ProgressSendError> {
@@ -218,11 +239,9 @@ impl<
 {
     type Msg = U;
 
-    type SendFuture<'a> = I::SendFuture<'a>;
-
-    fn send(&self, msg: U) -> Self::SendFuture<'_> {
+    async fn send(&self, msg: U) -> std::result::Result<(), ProgressSendError> {
         let msg = (self.1)(msg);
-        self.0.send(msg)
+        self.0.send(msg).await
     }
 
     fn try_send(&self, msg: U) -> std::result::Result<(), ProgressSendError> {
@@ -270,6 +289,17 @@ impl<I: IdGenerator, U, F> IdGenerator for WithFilterMap<I, U, F> {
 }
 
 impl<
+        I: IdGenerator + ProgressSender,
+        U: Send + Sync + 'static,
+        F: Fn(U) -> I::Msg + Clone + Send + Sync + 'static,
+    > IdGenerator for WithMap<I, U, F>
+{
+    fn new_id(&self) -> u64 {
+        self.0.new_id()
+    }
+}
+
+impl<
         I: ProgressSender,
         U: Send + Sync + 'static,
         F: Fn(U) -> Option<I::Msg> + Clone + Send + Sync + 'static,
@@ -277,16 +307,11 @@ impl<
 {
     type Msg = U;
 
-    type SendFuture<'a> = futures::future::Either<
-        I::SendFuture<'a>,
-        futures::future::Ready<std::result::Result<(), ProgressSendError>>,
-    >;
-
-    fn send(&self, msg: U) -> Self::SendFuture<'_> {
+    async fn send(&self, msg: U) -> std::result::Result<(), ProgressSendError> {
         if let Some(msg) = (self.1)(msg) {
-            self.0.send(msg).left_future()
+            self.0.send(msg).await
         } else {
-            futures::future::ok(()).right_future()
+            Ok(())
         }
     }
 
@@ -350,14 +375,11 @@ impl<T> IdGenerator for FlumeProgressSender<T> {
 impl<T: Send + Sync + 'static> ProgressSender for FlumeProgressSender<T> {
     type Msg = T;
 
-    type SendFuture<'a> =
-        futures::future::BoxFuture<'a, std::result::Result<(), ProgressSendError>>;
-
-    fn send(&self, msg: Self::Msg) -> Self::SendFuture<'_> {
+    async fn send(&self, msg: Self::Msg) -> std::result::Result<(), ProgressSendError> {
         self.sender
             .send_async(msg)
+            .await
             .map_err(|_| ProgressSendError::ReceiverDropped)
-            .boxed()
     }
 
     fn try_send(&self, msg: Self::Msg) -> std::result::Result<(), ProgressSendError> {
@@ -386,8 +408,103 @@ pub enum ProgressSendError {
     ReceiverDropped,
 }
 
+/// A result type for progress sending.
+pub type ProgressSendResult<T> = std::result::Result<T, ProgressSendError>;
+
 impl From<ProgressSendError> for std::io::Error {
     fn from(e: ProgressSendError) -> Self {
         std::io::Error::new(std::io::ErrorKind::BrokenPipe, e)
+    }
+}
+
+/// A slice writer that adds a synchronous progress callback.
+///
+/// This wraps any `AsyncSliceWriter`, passes through all operations to the inner writer, and
+/// calls the passed `on_write` callback whenever data is written.
+#[derive(Debug)]
+pub struct ProgressSliceWriter<W, F>(W, F);
+
+impl<W: AsyncSliceWriter, F: FnMut(u64)> ProgressSliceWriter<W, F> {
+    /// Create a new `ProgressSliceWriter` from an inner writer and a progress callback
+    ///
+    /// The `on_write` function is called for each write, with the `offset` as the first and the
+    /// length of the data as the second param.
+    pub fn new(inner: W, on_write: F) -> Self {
+        Self(inner, on_write)
+    }
+
+    /// Return the inner writer
+    pub fn into_inner(self) -> W {
+        self.0
+    }
+}
+
+impl<W: AsyncSliceWriter + 'static, F: FnMut(u64, usize) + 'static> AsyncSliceWriter
+    for ProgressSliceWriter<W, F>
+{
+    async fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> io::Result<()> {
+        (self.1)(offset, data.len());
+        self.0.write_bytes_at(offset, data).await
+    }
+
+    async fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
+        (self.1)(offset, data.len());
+        self.0.write_at(offset, data).await
+    }
+
+    async fn sync(&mut self) -> io::Result<()> {
+        self.0.sync().await
+    }
+
+    async fn set_len(&mut self, size: u64) -> io::Result<()> {
+        self.0.set_len(size).await
+    }
+}
+
+/// A slice writer that adds a fallible progress callback.
+///
+/// This wraps any `AsyncSliceWriter`, passes through all operations to the inner writer, and
+/// calls the passed `on_write` callback whenever data is written. `on_write` must return an
+/// `io::Result`, and can abort the download by returning an error.
+#[derive(Debug)]
+pub struct FallibleProgressSliceWriter<W, F>(W, F);
+
+impl<W: AsyncSliceWriter, F: Fn(u64, usize) -> io::Result<()> + 'static>
+    FallibleProgressSliceWriter<W, F>
+{
+    /// Create a new `ProgressSliceWriter` from an inner writer and a progress callback
+    ///
+    /// The `on_write` function is called for each write, with the `offset` as the first and the
+    /// length of the data as the second param. `on_write` must return a future which resolves to
+    /// an `io::Result`. If `on_write` returns an error, the download is aborted.
+    pub fn new(inner: W, on_write: F) -> Self {
+        Self(inner, on_write)
+    }
+
+    /// Return the inner writer.
+    pub fn into_inner(self) -> W {
+        self.0
+    }
+}
+
+impl<W: AsyncSliceWriter + 'static, F: Fn(u64, usize) -> io::Result<()> + 'static> AsyncSliceWriter
+    for FallibleProgressSliceWriter<W, F>
+{
+    async fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> io::Result<()> {
+        (self.1)(offset, data.len())?;
+        self.0.write_bytes_at(offset, data).await
+    }
+
+    async fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
+        (self.1)(offset, data.len())?;
+        self.0.write_at(offset, data).await
+    }
+
+    async fn sync(&mut self) -> io::Result<()> {
+        self.0.sync().await
+    }
+
+    async fn set_len(&mut self, size: u64) -> io::Result<()> {
+        self.0.set_len(size).await
     }
 }

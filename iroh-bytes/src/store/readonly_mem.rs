@@ -10,8 +10,8 @@ use std::{
 
 use crate::{
     store::{
-        EntryStatus, ExportMode, ImportMode, ImportProgress, Map, MapEntry, PartialMap,
-        PartialMapEntry, ReadableStore, ValidateProgress,
+        EntryStatus, ExportMode, ImportMode, ImportProgress, Map, MapEntry, MapEntryMut,
+        ReadableStore, ValidateProgress,
     },
     util::{
         progress::{IdGenerator, ProgressSender},
@@ -21,20 +21,14 @@ use crate::{
 };
 use bao_tree::{
     blake3,
-    io::{
-        outboard::{PreOrderMemOutboard, PreOrderOutboard},
-        sync::Outboard,
-    },
-    ChunkRanges,
+    io::{outboard::PreOrderMemOutboard, sync::Outboard},
 };
-use bytes::{Bytes, BytesMut};
-use futures::{
-    future::{self, BoxFuture},
-    FutureExt, Stream,
-};
+use bytes::Bytes;
+use futures::Stream;
+use iroh_io::AsyncSliceReader;
 use tokio::{io::AsyncWriteExt, sync::mpsc};
 
-use super::PossiblyPartialEntry;
+use super::{BaoBatchWriter, BaoBlobSize, DbIter, ExportProgressCb};
 
 /// A readonly in memory database for iroh-bytes.
 ///
@@ -113,7 +107,7 @@ impl Store {
     }
 
     /// Get the bytes associated with a hash, if they exist.
-    pub fn get(&self, hash: &Hash) -> Option<Bytes> {
+    pub fn get_content(&self, hash: &Hash) -> Option<Bytes> {
         let entry = self.0.get(hash)?;
         Some(entry.1.clone())
     }
@@ -142,7 +136,7 @@ impl Store {
         // create the directory in which the target file is
         tokio::fs::create_dir_all(parent).await?;
         let data = self
-            .get(&hash)
+            .get_content(&hash)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "hash not found"))?;
 
         let mut offset = 0u64;
@@ -165,31 +159,21 @@ pub struct Entry {
     data: Bytes,
 }
 
-/// The [PartialMapEntry] implementation for [Store].
-///
-/// This is an unoccupied type, since [Store] is does not allow creating partial entries.
-#[derive(Debug, Clone)]
-pub enum PartialEntry {}
-
-impl MapEntry<Store> for Entry {
-    fn hash(&self) -> blake3::Hash {
-        self.outboard.root()
+impl MapEntry for Entry {
+    fn hash(&self) -> Hash {
+        self.outboard.root().into()
     }
 
-    fn size(&self) -> u64 {
-        self.data.len() as u64
+    fn size(&self) -> BaoBlobSize {
+        BaoBlobSize::Verified(self.data.len() as u64)
     }
 
-    fn available_ranges(&self) -> BoxFuture<'_, io::Result<ChunkRanges>> {
-        futures::future::ok(ChunkRanges::all()).boxed()
+    async fn outboard(&self) -> io::Result<impl bao_tree::io::fsm::Outboard> {
+        Ok(self.outboard.clone())
     }
 
-    fn outboard(&self) -> BoxFuture<'_, io::Result<PreOrderMemOutboard<Bytes>>> {
-        futures::future::ok(self.outboard.clone()).boxed()
-    }
-
-    fn data_reader(&self) -> BoxFuture<'_, io::Result<Bytes>> {
-        futures::future::ok(self.data.clone()).boxed()
+    async fn data_reader(&self) -> io::Result<impl AsyncSliceReader> {
+        Ok(self.data.clone())
     }
 
     fn is_complete(&self) -> bool {
@@ -198,186 +182,155 @@ impl MapEntry<Store> for Entry {
 }
 
 impl Map for Store {
-    type Outboard = PreOrderMemOutboard<Bytes>;
-    type DataReader = Bytes;
     type Entry = Entry;
 
-    fn get(&self, hash: &Hash) -> Option<Self::Entry> {
-        let (o, d) = self.0.get(hash)?;
-        Some(Entry {
+    async fn get(&self, hash: &Hash) -> io::Result<Option<Self::Entry>> {
+        Ok(self.0.get(hash).map(|(o, d)| Entry {
             outboard: o.clone(),
             data: d.clone(),
-        })
+        }))
     }
 }
 
-impl PartialMap for Store {
-    type OutboardMut = PreOrderOutboard<BytesMut>;
+impl super::MapMut for Store {
+    type EntryMut = Entry;
 
-    type DataWriter = BytesMut;
+    async fn get_mut(&self, hash: &Hash) -> io::Result<Option<Self::EntryMut>> {
+        self.get(hash).await
+    }
 
-    type PartialEntry = PartialEntry;
-
-    fn get_or_create_partial(&self, _hash: Hash, _size: u64) -> io::Result<PartialEntry> {
+    async fn get_or_create(&self, _hash: Hash, _size: u64) -> io::Result<Entry> {
         Err(io::Error::new(
             io::ErrorKind::Other,
             "cannot create temp entry in readonly database",
         ))
     }
 
-    fn entry_status(&self, hash: &Hash) -> EntryStatus {
-        match self.0.contains_key(hash) {
+    fn entry_status_sync(&self, hash: &Hash) -> io::Result<EntryStatus> {
+        Ok(match self.0.contains_key(hash) {
             true => EntryStatus::Complete,
             false => EntryStatus::NotFound,
-        }
+        })
     }
 
-    fn get_possibly_partial(&self, hash: &Hash) -> PossiblyPartialEntry<Self> {
-        // return none because we do not have partial entries
-        if let Some((o, d)) = self.0.get(hash) {
-            PossiblyPartialEntry::Complete(Entry {
-                outboard: o.clone(),
-                data: d.clone(),
-            })
-        } else {
-            PossiblyPartialEntry::NotFound
-        }
+    async fn entry_status(&self, hash: &Hash) -> io::Result<EntryStatus> {
+        self.entry_status_sync(hash)
     }
 
-    fn insert_complete(&self, _entry: PartialEntry) -> BoxFuture<'_, io::Result<()>> {
+    async fn insert_complete(&self, _entry: Entry) -> io::Result<()> {
         // this is unreachable, since we cannot create partial entries
         unreachable!()
     }
 }
 
 impl ReadableStore for Store {
-    fn blobs(&self) -> Box<dyn Iterator<Item = Hash> + Send + Sync + 'static> {
-        Box::new(self.0.keys().cloned().collect::<Vec<_>>().into_iter())
+    async fn blobs(&self) -> io::Result<DbIter<Hash>> {
+        Ok(Box::new(
+            self.0
+                .keys()
+                .copied()
+                .map(Ok)
+                .collect::<Vec<_>>()
+                .into_iter(),
+        ))
     }
 
-    fn tags(&self) -> Box<dyn Iterator<Item = (Tag, HashAndFormat)> + Send + Sync + 'static> {
-        Box::new(std::iter::empty())
+    async fn tags(&self) -> io::Result<DbIter<(Tag, HashAndFormat)>> {
+        Ok(Box::new(std::iter::empty()))
     }
 
     fn temp_tags(&self) -> Box<dyn Iterator<Item = HashAndFormat> + Send + Sync + 'static> {
         Box::new(std::iter::empty())
     }
 
-    fn validate(
-        &self,
-        _tx: mpsc::Sender<ValidateProgress>,
-    ) -> BoxFuture<'static, anyhow::Result<()>> {
-        future::err(anyhow::anyhow!("not implemented")).boxed()
+    async fn validate(&self, _repair: bool, _tx: mpsc::Sender<ValidateProgress>) -> io::Result<()> {
+        Ok(())
     }
 
-    fn export(
+    async fn export(
         &self,
         hash: Hash,
         target: PathBuf,
         mode: ExportMode,
-        progress: impl Fn(u64) -> io::Result<()> + Send + Sync + 'static,
-    ) -> BoxFuture<'_, io::Result<()>> {
-        self.export_impl(hash, target, mode, progress).boxed()
+        progress: ExportProgressCb,
+    ) -> io::Result<()> {
+        self.export_impl(hash, target, mode, progress).await
     }
 
-    fn partial_blobs(&self) -> Box<dyn Iterator<Item = Hash> + Send + Sync + 'static> {
-        Box::new(std::iter::empty())
-    }
-}
-
-impl MapEntry<Store> for PartialEntry {
-    fn hash(&self) -> blake3::Hash {
-        // this is unreachable, since PartialEntry can not be created
-        unreachable!()
-    }
-
-    fn available_ranges(&self) -> BoxFuture<'_, io::Result<ChunkRanges>> {
-        // this is unreachable, since PartialEntry can not be created
-        unreachable!()
-    }
-
-    fn size(&self) -> u64 {
-        // this is unreachable, since PartialEntry can not be created
-        unreachable!()
-    }
-
-    fn outboard(&self) -> BoxFuture<'_, io::Result<PreOrderMemOutboard<Bytes>>> {
-        // this is unreachable, since PartialEntry can not be created
-        unreachable!()
-    }
-
-    fn data_reader(&self) -> BoxFuture<'_, io::Result<Bytes>> {
-        // this is unreachable, since PartialEntry can not be created
-        unreachable!()
-    }
-
-    fn is_complete(&self) -> bool {
-        // this is unreachable, since PartialEntry can not be created
-        unreachable!()
+    async fn partial_blobs(&self) -> io::Result<DbIter<Hash>> {
+        Ok(Box::new(std::iter::empty()))
     }
 }
 
-impl PartialMapEntry<Store> for PartialEntry {
-    fn outboard_mut(&self) -> BoxFuture<'_, io::Result<<Store as PartialMap>::OutboardMut>> {
-        // this is unreachable, since PartialEntry can not be created
-        unreachable!()
-    }
+impl MapEntryMut for Entry {
+    async fn batch_writer(&self) -> io::Result<impl BaoBatchWriter> {
+        enum Bar {}
+        impl BaoBatchWriter for Bar {
+            async fn write_batch(
+                &mut self,
+                _size: u64,
+                _batch: Vec<bao_tree::io::fsm::BaoContentItem>,
+            ) -> io::Result<()> {
+                unreachable!()
+            }
 
-    fn data_writer(&self) -> BoxFuture<'_, io::Result<<Store as PartialMap>::DataWriter>> {
-        // this is unreachable, since PartialEntry can not be created
-        unreachable!()
+            async fn sync(&mut self) -> io::Result<()> {
+                unreachable!()
+            }
+        }
+
+        #[allow(unreachable_code)]
+        Ok(unreachable!() as Bar)
     }
 }
 
 impl super::Store for Store {
-    fn import_file(
+    async fn import_file(
         &self,
         data: PathBuf,
         mode: ImportMode,
         format: BlobFormat,
         progress: impl ProgressSender<Msg = ImportProgress> + IdGenerator,
-    ) -> BoxFuture<'_, io::Result<(TempTag, u64)>> {
+    ) -> io::Result<(TempTag, u64)> {
         let _ = (data, mode, progress, format);
-        async move { Err(io::Error::new(io::ErrorKind::Other, "not implemented")) }.boxed()
+        Err(io::Error::new(io::ErrorKind::Other, "not implemented"))
     }
 
     /// import a byte slice
-    fn import_bytes(&self, bytes: Bytes, format: BlobFormat) -> BoxFuture<'_, io::Result<TempTag>> {
+    async fn import_bytes(&self, bytes: Bytes, format: BlobFormat) -> io::Result<TempTag> {
         let _ = (bytes, format);
-        async move { Err(io::Error::new(io::ErrorKind::Other, "not implemented")) }.boxed()
+        Err(io::Error::new(io::ErrorKind::Other, "not implemented"))
     }
 
-    fn import_stream(
+    async fn import_stream(
         &self,
         data: impl Stream<Item = io::Result<Bytes>> + Unpin + Send,
         format: BlobFormat,
         progress: impl ProgressSender<Msg = ImportProgress> + IdGenerator,
-    ) -> BoxFuture<'_, io::Result<(TempTag, u64)>> {
+    ) -> io::Result<(TempTag, u64)> {
         let _ = (data, format, progress);
-        async move { Err(io::Error::new(io::ErrorKind::Other, "not implemented")) }.boxed()
+        Err(io::Error::new(io::ErrorKind::Other, "not implemented"))
     }
 
-    fn clear_live(&self) {}
-
-    fn set_tag(&self, _name: Tag, _hash: Option<HashAndFormat>) -> BoxFuture<'_, io::Result<()>> {
-        async move { Err(io::Error::new(io::ErrorKind::Other, "not implemented")) }.boxed()
+    async fn set_tag(&self, _name: Tag, _hash: Option<HashAndFormat>) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Other, "not implemented"))
     }
 
-    fn create_tag(&self, _hash: HashAndFormat) -> BoxFuture<'_, io::Result<Tag>> {
-        async move { Err(io::Error::new(io::ErrorKind::Other, "not implemented")) }.boxed()
+    async fn create_tag(&self, _hash: HashAndFormat) -> io::Result<Tag> {
+        Err(io::Error::new(io::ErrorKind::Other, "not implemented"))
     }
 
     fn temp_tag(&self, inner: HashAndFormat) -> TempTag {
         TempTag::new(inner, None)
     }
 
-    fn add_live(&self, _live: impl IntoIterator<Item = Hash>) {}
-
-    fn delete(&self, _hash: &Hash) -> BoxFuture<'_, io::Result<()>> {
-        async move { Err(io::Error::new(io::ErrorKind::Other, "not implemented")) }.boxed()
+    async fn gc_start(&self) -> io::Result<()> {
+        Ok(())
     }
 
-    fn is_live(&self, _hash: &Hash) -> bool {
-        true
+    async fn delete(&self, _hashes: Vec<Hash>) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Other, "not implemented"))
     }
+
+    async fn shutdown(&self) {}
 }

@@ -1,114 +1,31 @@
 //! An endpoint that leverages a [quinn::Endpoint] backed by a [magicsock::MagicSock].
 
-use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use derive_more::Debug;
+use futures::StreamExt;
 use quinn_proto::VarInt;
-use serde::{Deserialize, Serialize};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use tracing::{debug, trace};
-use url::Url;
 
 use crate::{
     config,
     defaults::default_derp_map,
-    derp::{DerpMap, DerpMode},
+    derp::{DerpMap, DerpMode, DerpUrl},
+    discovery::{Discovery, DiscoveryTask},
     key::{PublicKey, SecretKey},
-    magicsock::{self, Discovery, MagicSock},
-    tls,
+    magicsock::{self, MagicSock},
+    tls, NodeId,
 };
 
-pub use super::magicsock::EndpointInfo as ConnectionInfo;
+pub use super::magicsock::{EndpointInfo as ConnectionInfo, LocalEndpointsStream};
 
-/// A peer and it's addressing information.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NodeAddr {
-    /// The node's public key.
-    pub node_id: PublicKey,
-    /// Addressing information to connect to [`Self::node_id`].
-    pub info: AddrInfo,
-}
+pub use iroh_base::node_addr::{AddrInfo, NodeAddr};
 
-impl NodeAddr {
-    /// Create a new [`NodeAddr`] with empty [`AddrInfo`].
-    pub fn new(node_id: PublicKey) -> Self {
-        NodeAddr {
-            node_id,
-            info: Default::default(),
-        }
-    }
-
-    /// Add a derp url to the peer's [`AddrInfo`].
-    pub fn with_derp_url(mut self, derp_url: Url) -> Self {
-        self.info.derp_url = Some(derp_url);
-        self
-    }
-
-    /// Add the given direct addresses to the peer's [`AddrInfo`].
-    pub fn with_direct_addresses(
-        mut self,
-        addresses: impl IntoIterator<Item = SocketAddr>,
-    ) -> Self {
-        self.info.direct_addresses = addresses.into_iter().collect();
-        self
-    }
-
-    /// Get the direct addresses of this peer.
-    pub fn direct_addresses(&self) -> impl Iterator<Item = &SocketAddr> {
-        self.info.direct_addresses.iter()
-    }
-
-    /// Get the derp url of this peer.
-    pub fn derp_url(&self) -> Option<&Url> {
-        self.info.derp_url.as_ref()
-    }
-}
-
-impl From<(PublicKey, Option<Url>, &[SocketAddr])> for NodeAddr {
-    fn from(value: (PublicKey, Option<Url>, &[SocketAddr])) -> Self {
-        let (node_id, derp_url, direct_addresses_iter) = value;
-        NodeAddr {
-            node_id,
-            info: AddrInfo {
-                derp_url,
-                direct_addresses: direct_addresses_iter.iter().copied().collect(),
-            },
-        }
-    }
-}
-
-/// Addressing information to connect to a peer.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct AddrInfo {
-    /// The peer's home DERP url.
-    pub derp_url: Option<Url>,
-    /// Socket addresses where the peer might be reached directly.
-    pub direct_addresses: BTreeSet<SocketAddr>,
-}
-
-impl AddrInfo {
-    /// Return whether this addressing information is empty.
-    pub fn is_empty(&self) -> bool {
-        self.derp_url.is_none() && self.direct_addresses.is_empty()
-    }
-}
-
-impl NodeAddr {
-    /// Create a new [`NodeAddr`] from its parts.
-    pub fn from_parts(
-        node_id: PublicKey,
-        derp_url: Option<Url>,
-        direct_addresses: Vec<SocketAddr>,
-    ) -> Self {
-        Self {
-            node_id,
-            info: AddrInfo {
-                derp_url,
-                direct_addresses: direct_addresses.into_iter().collect(),
-            },
-        }
-    }
-}
+/// The delay we add before starting a discovery in [`MagicEndpoint::connect`] if the user provided
+/// new direct addresses (to try these addresses before starting the discovery).
+const DISCOVERY_WAIT_PERIOD: Duration = Duration::from_millis(500);
 
 /// Builder for [MagicEndpoint]
 #[derive(Debug)]
@@ -211,6 +128,14 @@ impl MagicEndpointBuilder {
     }
 
     /// Optionally set a discovery mechanism for this endpoint.
+    ///
+    /// If you want to combine multiple discovery services, you can pass a
+    /// [`crate::discovery::ConcurrentDiscovery`].
+    ///
+    /// If no discovery service is set, connecting to a node without providing its
+    /// direct addresses or Derp URLs will fail.
+    ///
+    /// See the documentation of the [`Discovery`] trait for details.
     pub fn discovery(mut self, discovery: Box<dyn Discovery>) -> Self {
         self.discovery = Some(discovery);
         self
@@ -252,7 +177,8 @@ impl MagicEndpointBuilder {
     }
 }
 
-fn make_server_config(
+/// Create a [`quinn::ServerConfig`] with the given secret key and limits.
+pub fn make_server_config(
     secret_key: &SecretKey,
     alpn_protocols: Vec<Vec<u8>>,
     transport_config: Option<quinn::TransportConfig>,
@@ -261,6 +187,7 @@ fn make_server_config(
     let tls_server_config = tls::make_server_config(secret_key, alpn_protocols, keylog)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(tls_server_config));
     server_config.transport_config(Arc::new(transport_config.unwrap_or_default()));
+
     Ok(server_config)
 }
 
@@ -271,6 +198,7 @@ pub struct MagicEndpoint {
     msock: MagicSock,
     endpoint: quinn::Endpoint,
     keylog: bool,
+    cancel_token: CancellationToken,
 }
 
 impl MagicEndpoint {
@@ -313,6 +241,7 @@ impl MagicEndpoint {
             msock,
             endpoint,
             keylog,
+            cancel_token: CancellationToken::new(),
         })
     }
 
@@ -322,7 +251,7 @@ impl MagicEndpoint {
     }
 
     /// Get the node id of this endpoint.
-    pub fn node_id(&self) -> PublicKey {
+    pub fn node_id(&self) -> NodeId {
         self.secret_key.public()
     }
 
@@ -343,33 +272,53 @@ impl MagicEndpoint {
         self.msock.local_addr()
     }
 
-    /// Get the local and discovered endpoint addresses on which the underlying
-    /// magic socket is reachable.
+    /// Returns the local endpoints as a stream.
     ///
-    /// This list contains both the locally-bound addresses and the endpoint's
-    /// publicly-reachable addresses, if they could be discovered through
-    /// STUN or port mapping.
+    /// The [`MagicEndpoint`] continuously monitors the local endpoints, the network
+    /// addresses it can listen on, for changes.  Whenever changes are detected this stream
+    /// will yield a new list of endpoints.
     ///
-    /// If called before there are any endpoints, waits for the first time there are some.
-    pub async fn local_endpoints(&self) -> Result<Vec<config::Endpoint>> {
-        self.msock.local_endpoints().await
-    }
-
-    /// Waits for local endpoints to change and returns the new ones.
-    pub async fn local_endpoints_change(&self) -> Result<Vec<config::Endpoint>> {
-        self.msock.local_endpoints_change().await
+    /// Upon the first creation on the [`MagicSock`] it may not yet have completed a first
+    /// local endpoint discovery, in this case the first item of the stream will not be
+    /// immediately available.  Once this first set of local endpoints are discovered the
+    /// stream will always return the first set of endpoints immediately, which are the most
+    /// recently discovered endpoints.
+    ///
+    /// The list of endpoints yielded contains both the locally-bound addresses and the
+    /// endpoint's publicly-reachable addresses, if they could be discovered through STUN or
+    /// port mapping.
+    ///
+    /// # Examples
+    ///
+    /// To get the current endpoints, drop the stream after the first item was received:
+    /// ```
+    /// use futures::StreamExt;
+    /// use iroh_net::MagicEndpoint;
+    ///
+    /// # let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    /// # rt.block_on(async move {
+    /// let mep = MagicEndpoint::builder().bind(0).await.unwrap();
+    /// let _endpoints = mep.local_endpoints().next().await;
+    /// # });
+    /// ```
+    pub fn local_endpoints(&self) -> LocalEndpointsStream {
+        self.msock.local_endpoints()
     }
 
     /// Get the DERP url we are connected to with the lowest latency.
     ///
     /// Returns `None` if we are not connected to any DERPer.
-    pub fn my_derp(&self) -> Option<Url> {
+    pub fn my_derp(&self) -> Option<DerpUrl> {
         self.msock.my_derp()
     }
 
     /// Get the [`NodeAddr`] for this endpoint.
     pub async fn my_addr(&self) -> Result<NodeAddr> {
-        let addrs = self.local_endpoints().await?;
+        let addrs = self
+            .local_endpoints()
+            .next()
+            .await
+            .ok_or(anyhow!("No endpoints found"))?;
         let derp = self.my_derp();
         let addrs = addrs.into_iter().map(|x| x.addr).collect();
         Ok(NodeAddr::from_parts(self.node_id(), derp, addrs))
@@ -391,8 +340,8 @@ impl MagicEndpoint {
     /// Connections are currently only pruned on user action (when we explicitly add a new address
     /// to the internal addressbook through [`MagicEndpoint::add_node_addr`]), so these connections
     /// are not necessarily active connections.
-    pub async fn connection_infos(&self) -> anyhow::Result<Vec<ConnectionInfo>> {
-        self.msock.tracked_endpoints().await
+    pub fn connection_infos(&self) -> Vec<ConnectionInfo> {
+        self.msock.tracked_endpoints()
     }
 
     /// Get connection information about a specific node.
@@ -400,20 +349,12 @@ impl MagicEndpoint {
     /// Includes the node's [`PublicKey`], potential DERP Url, its addresses with any known
     /// latency, and its [`crate::magicsock::ConnectionType`], which let's us know if we are
     /// currently communicating with that node over a `Direct` (UDP) or `Relay` (DERP) connection.
-    pub async fn connection_info(
-        &self,
-        node_id: PublicKey,
-    ) -> anyhow::Result<Option<ConnectionInfo>> {
-        self.msock.tracked_endpoint(node_id).await
+    pub fn connection_info(&self, node_id: PublicKey) -> Option<ConnectionInfo> {
+        self.msock.tracked_endpoint(node_id)
     }
 
-    async fn resolve(&self, node_id: &PublicKey) -> Result<AddrInfo> {
-        if let Some(discovery) = self.msock.discovery() {
-            debug!("no mapping address for {node_id}, resolving via {discovery:?}");
-            discovery.resolve(node_id).await
-        } else {
-            anyhow::bail!("no discovery mechanism configured");
-        }
+    pub(crate) fn cancelled(&self) -> WaitForCancellationFuture<'_> {
+        self.cancel_token.cancelled()
     }
 
     /// Connect to a remote endpoint, using just the nodes's [`PublicKey`].
@@ -422,47 +363,64 @@ impl MagicEndpoint {
         node_id: &PublicKey,
         alpn: &[u8],
     ) -> Result<quinn::Connection> {
-        let addr = match self.msock.get_mapping_addr(node_id).await {
-            Some(addr) => addr,
-            None => {
-                let info = self.resolve(node_id).await?;
-                let peer_addr = NodeAddr {
-                    node_id: *node_id,
-                    info,
-                };
-                self.add_node_addr(peer_addr)?;
-                self.msock.get_mapping_addr(node_id).await.ok_or_else(|| {
-                    anyhow!("Failed to retrieve the mapped address from the magic socket. Unable to dial node {node_id:?}")
-                })?
-            }
-        };
-
-        debug!("connecting to {}: (via {})", node_id, addr);
-        self.connect_inner(node_id, alpn, addr).await
+        let addr = NodeAddr::new(*node_id);
+        self.connect(addr, alpn).await
     }
 
     /// Connect to a remote endpoint.
     ///
-    /// The PublicKey and the ALPN protocol are required. If you happen to know dialable addresses of
-    /// the remote endpoint, they can be specified and will be used to try and establish a direct
-    /// connection without involving a DERP server. If no addresses are specified, the endpoint
-    /// will try to dial the peer through the configured DERP servers.
+    /// A [`NodeAddr`] is required. It must contain the [`NodeId`] to dial and may also contain a
+    /// Derp URL and direct addresses. If direct addresses are provided, they will be used to
+    /// try and establish a direct connection without involving a Derp server.
     ///
-    /// If the `derp_url` is not `None` and the configured DERP servers do not include a DERP node from the given `derp_url`, it will error.
+    /// The `alpn`, or application-level protocol identifier, is also required. The remote endpoint
+    /// must support this `alpn`, otherwise the connection attempt will fail with an error.
     ///
-    /// If no UDP addresses and no DERP Url is provided, it will error.
+    /// If the [`NodeAddr`] contains only [`NodeId`] and no direct addresses and no Derp servers,
+    /// a discovery service will be invoked, if configured, to try and discover the node's
+    /// addressing information. The discovery services must be configured globally per [`MagicEndpoint`]
+    /// with [`MagicEndpointBuilder::discovery`]. The discovery service will also be invoked if
+    /// none of the existing or provided direct addresses are reachable.
+    ///
+    /// If addresses or Derp servers are neither provided nor can be discovered, the connection
+    /// attempt will fail with an error.
     pub async fn connect(&self, node_addr: NodeAddr, alpn: &[u8]) -> Result<quinn::Connection> {
-        self.add_node_addr(node_addr.clone())?;
+        if !node_addr.info.is_empty() {
+            self.add_node_addr(node_addr.clone())?;
+        }
 
         let NodeAddr { node_id, info } = node_addr;
-        let addr = self.msock.get_mapping_addr(&node_id).await;
-        let Some(addr) = addr else {
-            return Err(match (info.direct_addresses.is_empty(), info.derp_url) {
-                (true, None) => {
-                    anyhow!("No UDP addresses or DERP Url provided. Unable to dial node {node_id:?}")
-                }
-                _ => anyhow!("Failed to retrieve the mapped address from the magic socket. Unable to dial node {node_id:?}")
-            });
+
+        // Get the mapped IPv6 address from the magic socket. Quinn will connect to this address.
+        let (addr, discovery) = match self.msock.get_mapping_addr(&node_id) {
+            Some(addr) => {
+                // We got a mapped address, which means we either spoke to this endpoint before, or
+                // the user provided addressing info with the [`NodeAddr`].
+                // This does not mean that we can actually connect to any of these addresses.
+                // Therefore, we will invoke the discovery service if we haven't received from the
+                // endpoint on any of the existing paths recently.
+                // If the user provided addresses in this connect call, we will add a delay
+                // followed by a recheck before starting the discovery, to give the magicsocket a
+                // chance to test the newly provided addresses.
+                let delay = (!info.is_empty()).then_some(DISCOVERY_WAIT_PERIOD);
+                let discovery = DiscoveryTask::maybe_start_after_delay(self, node_id, delay)
+                    .ok()
+                    .flatten();
+                (addr, discovery)
+            }
+
+            None => {
+                // We have not spoken to this endpoint before, and the user provided no direct
+                // addresses or Derp URLs. Thus, we start a discovery task and wait for the first
+                // result to arrive, and only then continue, because otherwise we wouldn't have any
+                // path to the remote endpoint.
+                let mut discovery = DiscoveryTask::start(self.clone(), node_id)?;
+                discovery.first_arrived().await?;
+                let addr = self.msock.get_mapping_addr(&node_id).ok_or_else(|| {
+                    anyhow!("Failed to retrieve the mapped address from the magic socket. Unable to dial node {node_id:?}")
+                })?;
+                (addr, Some(discovery))
+            }
         };
 
         debug!(
@@ -470,10 +428,19 @@ impl MagicEndpoint {
             node_id, addr, info.direct_addresses
         );
 
-        self.connect_inner(&node_id, alpn, addr).await
+        // Start connecting via quinn. This will time out after 10 seconds if no reachable address
+        // is available.
+        let conn = self.connect_quinn(&node_id, alpn, addr).await;
+
+        // Cancel the node discovery task (if still running).
+        if let Some(discovery) = discovery {
+            discovery.cancel();
+        }
+
+        conn
     }
 
-    async fn connect_inner(
+    async fn connect_quinn(
         &self,
         node_id: &PublicKey,
         alpn: &[u8],
@@ -512,6 +479,7 @@ impl MagicEndpoint {
     ///
     /// If no UDP addresses are added, and `derp_url` is `None`, it will error.
     /// If no UDP addresses are added, and the given `derp_url` cannot be dialed, it will error.
+    // TODO: This is infallible, stop returning a result.
     pub fn add_node_addr(&self, node_addr: NodeAddr) -> Result<()> {
         self.msock.add_node_addr(node_addr);
         Ok(())
@@ -528,6 +496,7 @@ impl MagicEndpoint {
     /// Returns an error if closing the magic socket failed.
     /// TODO: Document error cases.
     pub async fn close(&self, error_code: VarInt, reason: &[u8]) -> Result<()> {
+        self.cancel_token.cancel();
         self.endpoint.close(error_code, reason);
         self.msock.close().await?;
         Ok(())
@@ -573,9 +542,9 @@ pub async fn get_alpn(connecting: &mut quinn::Connecting) -> Result<String> {
     match data.downcast::<quinn::crypto::rustls::HandshakeData>() {
         Ok(data) => match data.protocol {
             Some(protocol) => std::string::String::from_utf8(protocol).map_err(Into::into),
-            None => anyhow::bail!("no ALPN protocol available"),
+            None => bail!("no ALPN protocol available"),
         },
-        Err(_) => anyhow::bail!("unknown handshake type"),
+        Err(_) => bail!("unknown handshake type"),
     }
 }
 
@@ -583,11 +552,11 @@ pub async fn get_alpn(connecting: &mut quinn::Connecting) -> Result<String> {
 pub fn get_remote_node_id(connection: &quinn::Connection) -> Result<PublicKey> {
     let data = connection.peer_identity();
     match data {
-        None => anyhow::bail!("no peer certificate found"),
+        None => bail!("no peer certificate found"),
         Some(data) => match data.downcast::<Vec<rustls::Certificate>>() {
             Ok(certs) => {
                 if certs.len() != 1 {
-                    anyhow::bail!(
+                    bail!(
                         "expected a single peer certificate, but {} found",
                         certs.len()
                     );
@@ -595,7 +564,7 @@ pub fn get_remote_node_id(connection: &quinn::Connection) -> Result<PublicKey> {
                 let cert = tls::certificate::parse(&certs[0])?;
                 Ok(cert.peer_id())
             }
-            Err(_) => anyhow::bail!("invalid peer certificate"),
+            Err(_) => bail!("invalid peer certificate"),
         },
     }
 }
@@ -607,6 +576,7 @@ mod tests {
 
     use std::time::Instant;
 
+    use iroh_test::CallOnDrop;
     use rand_core::SeedableRng;
     use tracing::{error_span, info, info_span, Instrument};
 
@@ -616,7 +586,20 @@ mod tests {
 
     const TEST_ALPN: &[u8] = b"n0/iroh/test";
 
-    #[ignore]
+    #[test]
+    fn test_addr_info_debug() {
+        let info = AddrInfo {
+            derp_url: Some("https://derp.example.com".parse().unwrap()),
+            direct_addresses: vec![SocketAddr::from(([1, 2, 3, 4], 1234))]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(
+            format!("{:?}", info),
+            r#"AddrInfo { derp_url: Some(DerpUrl("https://derp.example.com./")), direct_addresses: {1.2.3.4:1234} }"#
+        );
+    }
+
     #[tokio::test]
     async fn magic_endpoint_connect_close() {
         let _guard = iroh_test::logging::setup();
@@ -642,7 +625,8 @@ mod tests {
                     let mut buf = [0u8, 5];
                     stream.read_exact(&mut buf).await.unwrap();
                     info!("Accepted 1 stream, received {buf:?}.  Closing now.");
-                    ep.close(7u8.into(), b"bye").await.unwrap();
+                    // close the stream
+                    conn.close(7u8.into(), b"bye");
 
                     let res = conn.accept_uni().await;
                     assert_eq!(res.unwrap_err(), quinn::ConnectionError::LocallyClosed);
@@ -708,6 +692,7 @@ mod tests {
 
     /// Test that peers saved on shutdown are correctly loaded
     #[tokio::test]
+    #[cfg_attr(target_os = "windows", ignore = "flaky")]
     async fn save_load_peers() {
         let _guard = iroh_test::logging::setup();
 
@@ -737,10 +722,10 @@ mod tests {
         let node_addr = NodeAddr::new(peer_id).with_direct_addresses([direct_addr]);
 
         info!("setting up first endpoint");
-        // first time, create a magic endpoint without peers but a peers file and add adressing
+        // first time, create a magic endpoint without peers but a peers file and add addressing
         // information for a peer
         let endpoint = new_endpoint(secret_key.clone(), path.clone()).await;
-        assert!(endpoint.connection_infos().await.unwrap().is_empty());
+        assert!(endpoint.connection_infos().is_empty());
         endpoint.add_node_addr(node_addr).unwrap();
 
         info!("closing endpoint");
@@ -750,22 +735,24 @@ mod tests {
         info!("restarting endpoint");
         // now restart it and check the addressing info of the peer
         let endpoint = new_endpoint(secret_key, path).await;
-        let ConnectionInfo { mut addrs, .. } =
-            endpoint.connection_info(peer_id).await.unwrap().unwrap();
+        let ConnectionInfo { mut addrs, .. } = endpoint.connection_info(peer_id).unwrap();
         let conn_addr = addrs.pop().unwrap().addr;
         assert_eq!(conn_addr, direct_addr);
     }
 
     #[tokio::test]
     async fn magic_endpoint_derp_connect_loop() {
-        let _guard = iroh_test::logging::setup();
-        let n_iters = 5;
+        let _logging_guard = iroh_test::logging::setup();
+        let start = Instant::now();
+        let n_clients = 5;
         let n_chunks_per_client = 2;
         let chunk_size = 10;
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42);
-        let (derp_map, derp_url, _guard) = run_derper().await.unwrap();
+        let (derp_map, derp_url, _derp_guard) = run_derper().await.unwrap();
         let server_secret_key = SecretKey::generate_with_rng(&mut rng);
         let server_node_id = server_secret_key.public();
+
+        // The server accepts the connections of the clients sequentially.
         let server = {
             let derp_map = derp_map.clone();
             tokio::spawn(
@@ -774,16 +761,16 @@ mod tests {
                         .secret_key(server_secret_key)
                         .alpns(vec![TEST_ALPN.to_vec()])
                         .derp_mode(DerpMode::Custom(derp_map))
-                        .bind(12345)
+                        .bind(0)
                         .await
                         .unwrap();
                     let eps = ep.local_addr().unwrap();
                     info!(me = %ep.node_id().fmt_short(), ipv4=%eps.0, ipv6=?eps.1, "server bound");
-                    for i in 0..n_iters {
+                    for i in 0..n_clients {
                         let now = Instant::now();
                         println!("[server] round {}", i + 1);
-                        let conn = ep.accept().await.unwrap();
-                        let (peer_id, _alpn, conn) = accept_conn(conn).await.unwrap();
+                        let incoming = ep.accept().await.unwrap();
+                        let (peer_id, _alpn, conn) = accept_conn(incoming).await.unwrap();
                         info!(%i, peer = %peer_id.fmt_short(), "accepted connection");
                         let (mut send, mut recv) = conn.accept_bi().await.unwrap();
                         let mut buf = vec![0u8; chunk_size];
@@ -800,124 +787,114 @@ mod tests {
                 .instrument(error_span!("server")),
             )
         };
-
-        let client_secret_key = SecretKey::generate_with_rng(&mut rng);
-        let client = tokio::spawn(async move {
-            for i in 0..n_iters {
-                let now = Instant::now();
-                println!("[client] round {}", i + 1);
-                let derp_map = derp_map.clone();
-                let client_secret_key = client_secret_key.clone();
-                let derp_url = derp_url.clone();
-                let fut = async move {
-                    info!("client binding");
-                    let start = Instant::now();
-                    let ep = MagicEndpoint::builder()
-                        .alpns(vec![TEST_ALPN.to_vec()])
-                        .derp_mode(DerpMode::Custom(derp_map))
-                        .secret_key(client_secret_key)
-                        .bind(0)
-                        .await
-                        .unwrap();
-                    let eps = ep.local_addr().unwrap();
-                    info!(me = %ep.node_id().fmt_short(), ipv4=%eps.0, ipv6=?eps.1, t = ?start.elapsed(), "client bound");
-                    let node_addr = NodeAddr::new(server_node_id).with_derp_url(derp_url);
-                    info!(to = ?node_addr, "client connecting");
-                    let t = Instant::now();
-                    let conn = ep.connect(node_addr, TEST_ALPN).await.unwrap();
-                    info!(t = ?t.elapsed(), "client connected");
-                    let t = Instant::now();
-                    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-
-                    for i in 0..n_chunks_per_client {
-                        let mut buf = vec![i; chunk_size];
-                        send.write_all(&buf).await.unwrap();
-                        recv.read_exact(&mut buf).await.unwrap();
-                        assert_eq!(buf, vec![i; chunk_size]);
-                    }
-                    send.finish().await.unwrap();
-                    recv.read_to_end(0).await.unwrap();
-                    info!(t = ?t.elapsed(), "client finished");
-                    ep.close(0u32.into(), &[]).await.unwrap();
-                    info!(total = ?start.elapsed(), "client closed");
-                }
-                .instrument(error_span!("client", %i));
-                tokio::task::spawn(fut).await.unwrap();
-                println!("[client] round {} done in {:?}", i + 1, now.elapsed());
-            }
+        let abort_handle = server.abort_handle();
+        let _server_guard = CallOnDrop::new(move || {
+            abort_handle.abort();
         });
 
-        client.await.unwrap();
-        server.abort();
-        let _ = server.await;
+        for i in 0..n_clients {
+            let now = Instant::now();
+            println!("[client] round {}", i + 1);
+            let derp_map = derp_map.clone();
+            let client_secret_key = SecretKey::generate_with_rng(&mut rng);
+            let derp_url = derp_url.clone();
+            async {
+                info!("client binding");
+                let ep = MagicEndpoint::builder()
+                    .alpns(vec![TEST_ALPN.to_vec()])
+                    .derp_mode(DerpMode::Custom(derp_map))
+                    .secret_key(client_secret_key)
+                    .bind(0)
+                    .await
+                    .unwrap();
+                let eps = ep.local_addr().unwrap();
+                info!(me = %ep.node_id().fmt_short(), ipv4=%eps.0, ipv6=?eps.1, "client bound");
+                let node_addr = NodeAddr::new(server_node_id).with_derp_url(derp_url);
+                info!(to = ?node_addr, "client connecting");
+                let conn = ep.connect(node_addr, TEST_ALPN).await.unwrap();
+                info!("client connected");
+                let (mut send, mut recv) = conn.open_bi().await.unwrap();
+
+                for i in 0..n_chunks_per_client {
+                    let mut buf = vec![i; chunk_size];
+                    send.write_all(&buf).await.unwrap();
+                    recv.read_exact(&mut buf).await.unwrap();
+                    assert_eq!(buf, vec![i; chunk_size]);
+                }
+                send.finish().await.unwrap();
+                recv.read_to_end(0).await.unwrap();
+                info!("client finished");
+                ep.close(0u32.into(), &[]).await.unwrap();
+                info!("client closed");
+            }
+            .instrument(error_span!("client", %i))
+            .await;
+            println!("[client] round {} done in {:?}", i + 1, now.elapsed());
+        }
+
+        server.await.unwrap();
+
+        // We appear to have seen this being very slow at times.  So ensure we fail if this
+        // test is too slow.  We're only making two connections transferring very little
+        // data, this really shouldn't take long.
+        if start.elapsed() > Duration::from_secs(15) {
+            panic!("Test too slow, something went wrong");
+        }
     }
 
-    // #[tokio::test]
-    // async fn magic_endpoint_bidi_send_recv() {
-    //     setup_logging();
-    //     let (ep1, ep2, cleanup) = setup_pair().await.unwrap();
+    #[tokio::test]
+    async fn magic_endpoint_bidi_send_recv() {
+        let _logging_guard = iroh_test::logging::setup();
+        let ep1 = MagicEndpoint::builder()
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .derp_mode(DerpMode::Disabled)
+            .bind(0)
+            .await
+            .unwrap();
+        let ep2 = MagicEndpoint::builder()
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .derp_mode(DerpMode::Disabled)
+            .bind(0)
+            .await
+            .unwrap();
+        let ep1_nodeaddr = ep1.my_addr().await.unwrap();
+        let ep2_nodeaddr = ep2.my_addr().await.unwrap();
+        ep1.add_node_addr(ep2_nodeaddr.clone()).unwrap();
+        ep2.add_node_addr(ep1_nodeaddr.clone()).unwrap();
+        let ep1_nodeid = ep1.node_id();
+        let ep2_nodeid = ep2.node_id();
+        eprintln!("node id 1 {ep1_nodeid}");
+        eprintln!("node id 2 {ep2_nodeid}");
 
-    //     let peer_id_1 = ep1.node_id();
-    //     eprintln!("node id 1 {peer_id_1}");
-    //     let peer_id_2 = ep2.node_id();
-    //     eprintln!("node id 2 {peer_id_2}");
+        async fn connect_hello(ep: MagicEndpoint, dst: NodeAddr) {
+            let conn = ep.connect(dst, TEST_ALPN).await.unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            send.write_all(b"hello").await.unwrap();
+            send.finish().await.unwrap();
+            let m = recv.read_to_end(100).await.unwrap();
+            assert_eq!(m, b"world");
+        }
 
-    //     let endpoint = ep2.clone();
-    //     let p2_connect = tokio::spawn(async move {
-    //         let conn = endpoint.connect(peer_id_1, TEST_ALPN, &[]).await.unwrap();
-    //         let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    //         send.write_all(b"hello").await.unwrap();
-    //         send.finish().await.unwrap();
-    //         let m = recv.read_to_end(100).await.unwrap();
-    //         assert_eq!(&m, b"world");
-    //     });
+        async fn accept_world(ep: MagicEndpoint, src: NodeId) {
+            let incoming = ep.accept().await.unwrap();
+            let (node_id, alpn, conn) = accept_conn(incoming).await.unwrap();
+            assert_eq!(node_id, src);
+            assert_eq!(alpn.as_bytes(), TEST_ALPN);
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let m = recv.read_to_end(100).await.unwrap();
+            assert_eq!(m, b"hello");
+            send.write_all(b"world").await.unwrap();
+            send.finish().await.unwrap();
+        }
 
-    //     let endpoint = ep1.clone();
-    //     let p1_accept = tokio::spawn(async move {
-    //         let conn = endpoint.accept().await.unwrap();
-    //         let (peer_id, alpn, conn) = accept_conn(conn).await.unwrap();
-    //         assert_eq!(peer_id, peer_id_2);
-    //         assert_eq!(alpn.as_bytes(), TEST_ALPN);
+        let p1_accept = tokio::spawn(accept_world(ep1.clone(), ep2_nodeid));
+        let p2_accept = tokio::spawn(accept_world(ep2.clone(), ep1_nodeid));
+        let p1_connect = tokio::spawn(connect_hello(ep1.clone(), ep2_nodeaddr));
+        let p2_connect = tokio::spawn(connect_hello(ep2.clone(), ep1_nodeaddr));
 
-    //         let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-    //         let m = recv.read_to_end(100).await.unwrap();
-    //         assert_eq!(m, b"hello");
-
-    //         send.write_all(b"world").await.unwrap();
-    //         send.finish().await.unwrap();
-    //     });
-
-    //     let endpoint = ep1.clone();
-    //     let p1_connect = tokio::spawn(async move {
-    //         let conn = endpoint.connect(peer_id_2, TEST_ALPN, &[]).await.unwrap();
-    //         let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    //         send.write_all(b"ola").await.unwrap();
-    //         send.finish().await.unwrap();
-    //         let m = recv.read_to_end(100).await.unwrap();
-    //         assert_eq!(&m, b"mundo");
-    //     });
-
-    //     let endpoint = ep2.clone();
-    //     let p2_accept = tokio::spawn(async move {
-    //         let conn = endpoint.accept().await.unwrap();
-    //         let (peer_id, alpn, conn) = accept_conn(conn).await.unwrap();
-    //         assert_eq!(peer_id, peer_id_1);
-    //         assert_eq!(alpn.as_bytes(), TEST_ALPN);
-
-    //         let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-    //         let m = recv.read_to_end(100).await.unwrap();
-    //         assert_eq!(m, b"ola");
-
-    //         send.write_all(b"mundo").await.unwrap();
-    //         send.finish().await.unwrap();
-    //     });
-
-    //     p1_accept.await.unwrap();
-    //     p2_connect.await.unwrap();
-
-    //     p2_accept.await.unwrap();
-    //     p1_connect.await.unwrap();
-
-    //     cleanup().await;
-    // }
+        p1_accept.await.unwrap();
+        p2_accept.await.unwrap();
+        p1_connect.await.unwrap();
+        p2_connect.await.unwrap();
+    }
 }

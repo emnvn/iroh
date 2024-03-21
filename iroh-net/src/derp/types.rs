@@ -1,15 +1,12 @@
 use std::num::NonZeroU32;
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use postcard::experimental::max_size::MaxSize;
 use serde::{Deserialize, Serialize};
 
 use super::{client_conn::ClientConnBuilder, codec::PROTOCOL_VERSION};
 use crate::key::PublicKey;
-
-/// A key to identify if a node belongs in a mesh
-pub type MeshKey = [u8; 32];
 
 pub(crate) struct RateLimiter {
     inner: governor::RateLimiter<
@@ -25,8 +22,10 @@ impl RateLimiter {
         if bytes_per_second == 0 || bytes_burst == 0 {
             return Ok(None);
         }
-        let bytes_per_second = NonZeroU32::new(u32::try_from(bytes_per_second)?).unwrap();
-        let bytes_burst = NonZeroU32::new(u32::try_from(bytes_burst)?).unwrap();
+        let bytes_per_second = NonZeroU32::new(u32::try_from(bytes_per_second)?)
+            .context("bytes_per_second not non-zero")?;
+        let bytes_burst =
+            NonZeroU32::new(u32::try_from(bytes_burst)?).context("bytes_burst not non-zero")?;
         Ok(Some(Self {
             inner: governor::RateLimiter::direct(
                 governor::Quota::per_second(bytes_per_second).allow_burst(bytes_burst),
@@ -35,8 +34,7 @@ impl RateLimiter {
     }
 
     pub(crate) fn check_n(&self, n: usize) -> Result<()> {
-        ensure!(n != 0);
-        let n = NonZeroU32::new(u32::try_from(n)?).unwrap();
+        let n = NonZeroU32::new(u32::try_from(n)?).context("n not non-zero")?;
         match self.inner.check_n(n) {
             Ok(_) => Ok(()),
             Err(_) => bail!("batch cannot go through"),
@@ -53,22 +51,13 @@ pub(crate) struct Packet {
     pub(crate) bytes: Bytes,
 }
 
-/// PeerConnState represents whether or not a peer is connected to the server.
-#[derive(Debug, Clone)]
-pub(crate) struct PeerConnState {
-    pub(crate) peer: PublicKey,
-    pub(crate) present: bool,
-}
-
 #[derive(Debug, Serialize, Deserialize, MaxSize, PartialEq, Eq)]
 pub(crate) struct ClientInfo {
     /// The DERP protocol version that the client was built with.
     /// See [`PROTOCOL_VERSION`].
     pub(crate) version: usize,
-    /// Optionally specifies a pre-shared key used by trusted clients.
-    /// It's required to subscribe to the connection list and forward
-    /// packets. It's empty for regular users.
-    pub(crate) mesh_key: Option<MeshKey>,
+    /// Unused field, ignored by the relay server.
+    pub(crate) mesh_key: Option<[u8; 32]>,
     /// Whether the client declares it's able to ack pings
     pub(crate) can_ack_pings: bool,
     /// Whether this client is a prober.
@@ -98,33 +87,12 @@ impl ServerInfo {
     }
 }
 
-/// A `PacketForwarder` can forward a packet to the `dstkey` from the `srckey`.
-///
-/// The main implementation of a `PacketForwarder` is the private struct `ClientConnManager`,
-/// which is the [`super::server::Server`] side representation of a [`super::client::Client`]
-/// connection.
-pub trait PacketForwarder: Send + Sync + 'static {
-    /// Forward a packet from the `srckey` to the `dstkey`
-    fn forward_packet(&mut self, srckey: PublicKey, dstkey: PublicKey, packet: Bytes);
-}
-
 #[derive(derive_more::Debug)]
-pub(crate) enum ServerMessage<P>
-where
-    P: PacketForwarder,
-{
-    AddWatcher(PublicKey),
-    ClosePeer(PublicKey),
+pub(crate) enum ServerMessage {
     SendPacket((PublicKey, Packet)),
     SendDiscoPacket((PublicKey, Packet)),
     #[debug("CreateClient")]
-    CreateClient(ClientConnBuilder<P>),
+    CreateClient(ClientConnBuilder),
     RemoveClient((PublicKey, usize)),
-    AddPacketForwarder {
-        key: PublicKey,
-        #[debug("PacketForwarder")]
-        forwarder: P,
-    },
-    RemovePacketForwarder(PublicKey),
     Shutdown,
 }

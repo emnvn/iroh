@@ -164,6 +164,8 @@ impl super::Store for Store {
         }
         self.replica_records.write().remove(namespace);
         self.namespaces.write().remove(namespace);
+        self.peers_per_doc.write().remove(namespace);
+        self.download_policies.write().remove(namespace);
         Ok(())
     }
 
@@ -200,6 +202,7 @@ impl super::Store for Store {
 
     /// Get all content hashes of all replicas in the store.
     fn content_hashes(&self) -> Result<Self::ContentHashesIter<'_>> {
+        tracing::info!("getting content hashes");
         let records = self.replica_records.read();
         Ok(ContentHashesIterator {
             records,
@@ -218,6 +221,10 @@ impl super::Store for Store {
     }
 
     fn register_useful_peer(&self, namespace: NamespaceId, peer: crate::PeerIdBytes) -> Result<()> {
+        anyhow::ensure!(
+            self.namespaces.read().contains_key(&namespace),
+            "document not created"
+        );
         let mut per_doc_cache = self.peers_per_doc.write();
         per_doc_cache
             .entry(namespace)
@@ -238,6 +245,11 @@ impl super::Store for Store {
     }
 
     fn set_download_policy(&self, namespace: &NamespaceId, policy: DownloadPolicy) -> Result<()> {
+        anyhow::ensure!(
+            self.namespaces.read().contains_key(namespace),
+            "document not created"
+        );
+
         self.download_policies.write().insert(*namespace, policy);
         Ok(())
     }
@@ -562,12 +574,15 @@ impl crate::ranger::Store<SignedEntry> for ReplicaStoreInstance {
     }
 
     fn put(&mut self, e: SignedEntry) -> Result<(), Self::Error> {
+        let hash = e.entry().content_hash();
+        tracing::info!("putting entry {}", &hash.to_hex()[..8]);
         self.with_latest_mut_with_default(|records| {
             records.insert(e.author_bytes(), (e.timestamp(), e.key().to_vec()));
         });
         self.with_records_mut_with_default(|records| {
             records.insert(e);
         });
+        tracing::info!("done putting entry {}", &hash.to_hex()[..8]);
         Ok(())
     }
 

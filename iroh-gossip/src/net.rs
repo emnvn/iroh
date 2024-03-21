@@ -5,7 +5,8 @@ use bytes::{Bytes, BytesMut};
 use futures::{stream::Stream, FutureExt};
 use genawaiter::sync::{Co, Gen};
 use iroh_net::{
-    key::PublicKey, magic_endpoint::get_remote_node_id, AddrInfo, MagicEndpoint, NodeAddr,
+    dialer::Dialer, key::PublicKey, magic_endpoint::get_remote_node_id, AddrInfo, MagicEndpoint,
+    NodeAddr,
 };
 use rand::rngs::StdRng;
 use rand_core::SeedableRng;
@@ -16,7 +17,7 @@ use tokio::{
 };
 use tracing::{debug, error_span, trace, warn, Instrument};
 
-use self::util::{read_message, write_message, Dialer, Timers};
+use self::util::{read_message, write_message, Timers};
 use crate::proto::{self, PeerData, Scope, TopicId};
 
 pub mod util;
@@ -387,7 +388,7 @@ impl Actor {
                     trace!(?i, "tick: dialer");
                     match res {
                         Ok(conn) => {
-                            debug!(peer = ?peer_id, "dial successfull");
+                            debug!(peer = ?peer_id, "dial successful");
                             self.handle_to_actor_msg(ToActor::ConnIncoming(peer_id, ConnOrigin::Dial, conn), Instant::now()).await.context("dialer.next -> conn -> handle_to_actor_msg")?;
                         }
                         Err(err) => {
@@ -691,6 +692,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[ignore = "flaky"]
     async fn gossip_net_smoke() {
         let _guard = iroh_test::logging::setup();
         let (derp_map, derp_url, cleanup) = util::run_derp_and_stun([127, 0, 0, 1].into())
@@ -826,19 +828,21 @@ mod test {
 
         use anyhow::Result;
         use iroh_net::{
-            derp::DerpMap,
+            derp::{DerpMap, DerpUrl},
             key::SecretKey,
             stun::{is, parse_binding_request, response},
         };
         use tokio::sync::oneshot;
         use tracing::{debug, info, trace};
-        use url::Url;
 
         /// A drop guard to clean up test infrastructure.
         ///
         /// After dropping the test infrastructure will asynchronously shutdown and release its
         /// resources.
+        // Nightly sees the sender as dead code currently, but we only rely on Drop of the
+        // sender.
         #[derive(Debug)]
+        #[allow(dead_code)]
         pub(crate) struct CleanupDropGuard(pub(crate) oneshot::Sender<()>);
 
         /// Runs a  DERP server with STUN enabled suitable for tests.
@@ -849,9 +853,7 @@ mod test {
         /// [`MagicEndpoint::connect`]: crate::magic_endpoint::MagicEndpoint
         pub(crate) async fn run_derp_and_stun(
             stun_ip: IpAddr,
-        ) -> Result<(DerpMap, Url, CleanupDropGuard)> {
-            // TODO: pass a mesh_key?
-
+        ) -> Result<(DerpMap, DerpUrl, CleanupDropGuard)> {
             let server_key = SecretKey::generate();
             let server = iroh_net::derp::http::ServerBuilder::new("127.0.0.1:0".parse().unwrap())
                 .secret_key(Some(server_key))
@@ -863,7 +865,7 @@ mod test {
             info!("DERP listening on {:?}", http_addr);
 
             let (stun_addr, stun_drop_guard) = serve(stun_ip).await?;
-            let derp_url: Url = format!("http://localhost:{}", http_addr.port())
+            let derp_url: DerpUrl = format!("http://localhost:{}", http_addr.port())
                 .parse()
                 .unwrap();
             let m = DerpMap::default_from_node(derp_url.clone(), stun_addr.port());

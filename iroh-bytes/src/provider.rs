@@ -9,7 +9,7 @@ use iroh_base::rpc::RpcError;
 use iroh_io::stats::{
     SliceReaderStats, StreamWriterStats, TrackingSliceReader, TrackingStreamWriter,
 };
-use iroh_io::{AsyncStreamWriter, TokioStreamWriter};
+use iroh_io::{AsyncSliceReader, AsyncStreamWriter, TokioStreamWriter};
 use serde::{Deserialize, Serialize};
 use tokio_util::task::LocalPoolHandle;
 use tracing::{debug, debug_span, info, trace, warn};
@@ -184,8 +184,8 @@ pub async fn transfer_collection<D: Map, E: EventSender>(
     // Response writer, containing the quinn stream.
     writer: &mut ResponseWriter<E>,
     // the collection to transfer
-    mut outboard: D::Outboard,
-    mut data: D::DataReader,
+    mut outboard: impl Outboard,
+    mut data: impl AsyncSliceReader,
     stats: &mut TransferStats,
 ) -> Result<SentStatus> {
     let hash = request.hash;
@@ -357,7 +357,7 @@ pub async fn handle_get<D: Map, E: EventSender>(
         .await;
 
     // 4. Attempt to find hash
-    match db.get(&hash) {
+    match db.get(&hash).await? {
         // Collection or blob request
         Some(entry) => {
             let mut stats = Box::<TransferStats>::default();
@@ -451,7 +451,7 @@ impl<E: EventSender> ResponseWriter<E> {
     }
 
     async fn notify_transfer_completed(&self, hash: &Hash, stats: Box<TransferStats>) {
-        info!("trasnfer completed for {}", hash);
+        info!("transfer completed for {}", hash);
         Self::print_stats(&stats);
         self.events
             .send(Event::TransferCompleted {
@@ -492,7 +492,7 @@ pub async fn send_blob<D: Map, W: AsyncStreamWriter>(
     ranges: &RangeSpec,
     writer: W,
 ) -> Result<(SentStatus, u64, SliceReaderStats)> {
-    match db.get(&name) {
+    match db.get(&name).await? {
         Some(entry) => {
             let outboard = entry.outboard().await?;
             let size = outboard.tree().size().0;

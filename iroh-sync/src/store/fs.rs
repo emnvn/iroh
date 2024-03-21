@@ -280,6 +280,12 @@ impl super::Store for Store {
             let mut namespace_table = write_tx.open_table(NAMESPACES_TABLE)?;
             namespace_table.remove(namespace.as_bytes())?;
         }
+        {
+            let mut peers_table = write_tx.open_multimap_table(NAMESPACE_PEERS_TABLE)?;
+            peers_table.remove_all(namespace.as_bytes())?;
+            let mut dl_policies_table = write_tx.open_table(DOWNLOAD_POLICY_TABLE)?;
+            dl_policies_table.remove(namespace.as_bytes())?;
+        }
         write_tx.commit()?;
         Ok(())
     }
@@ -321,6 +327,10 @@ impl super::Store for Store {
             .map(|duration| duration.as_nanos() as u64)?;
         let write_tx = self.db.begin_write()?;
         {
+            // ensure the document exists
+            let namespaces = write_tx.open_table(NAMESPACES_TABLE)?;
+            anyhow::ensure!(namespaces.get(namespace)?.is_some(), "document not created");
+
             let mut peers_table = write_tx.open_multimap_table(NAMESPACE_PEERS_TABLE)?;
             let mut namespace_peers = peers_table.get(namespace)?;
 
@@ -404,9 +414,18 @@ impl super::Store for Store {
     fn set_download_policy(&self, namespace: &NamespaceId, policy: DownloadPolicy) -> Result<()> {
         let tx = self.db.begin_write()?;
         {
+            let namespace = namespace.as_bytes();
+
+            // ensure the document exists
+            let namespaces = tx.open_table(NAMESPACES_TABLE)?;
+            anyhow::ensure!(
+                namespaces.get(&namespace)?.is_some(),
+                "document not created"
+            );
+
             let mut table = tx.open_table(DOWNLOAD_POLICY_TABLE)?;
             let value = postcard::to_stdvec(&policy)?;
-            table.insert(namespace.as_bytes(), value.as_slice())?;
+            table.insert(namespace, value.as_slice())?;
         }
         tx.commit()?;
         Ok(())

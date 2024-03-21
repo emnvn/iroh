@@ -13,18 +13,17 @@ use std::{
 use anyhow::{anyhow, bail, Context as _, Result};
 use clap::Parser;
 use futures::{Future, StreamExt};
-use http::response::Builder as ResponseBuilder;
+use http::{response::Builder as ResponseBuilder, HeaderMap};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use iroh_metrics::inc;
 use iroh_net::defaults::{DEFAULT_DERP_STUN_PORT, NA_DERP_HOSTNAME};
-use iroh_net::derp;
 use iroh_net::derp::http::{
-    MeshAddrs, ServerBuilder as DerpServerBuilder, TlsAcceptor, TlsConfig as DerpTlsConfig,
+    ServerBuilder as DerpServerBuilder, TlsAcceptor, TlsConfig as DerpTlsConfig,
 };
+use iroh_net::derp::{self};
 use iroh_net::key::SecretKey;
 use iroh_net::stun;
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use tokio::net::{TcpListener, UdpSocket};
@@ -49,7 +48,7 @@ fn body_empty() -> BytesBody {
 struct Cli {
     /// Run in localhost development mode over plain HTTP.
     ///
-    /// Defaults to running the derper on port 334.
+    /// Defaults to running the derper on port 3340.
     ///
     /// Running in dev mode will ignore any config file fields pertaining to TLS.
     #[clap(long, default_value_t = false)]
@@ -90,12 +89,13 @@ impl CertMode {
 
                 tokio::spawn(
                     async move {
-                        loop {
-                            match state.next().await.unwrap() {
+                        while let Some(event) = state.next().await {
+                            match event {
                                 Ok(ok) => debug!("acme event: {:?}", ok),
                                 Err(err) => error!("error: {:?}", err),
                             }
                         }
+                        debug!("event stream finished");
                     }
                     .instrument(info_span!("acme")),
                 );
@@ -126,7 +126,8 @@ impl CertMode {
 }
 
 fn escape_hostname(hostname: &str) -> Cow<'_, str> {
-    let unsafe_hostname_characters = regex::Regex::new(r"[^a-zA-Z0-9-\.]").unwrap();
+    let unsafe_hostname_characters =
+        regex::Regex::new(r"[^a-zA-Z0-9-\.]").expect("regex manually checked");
     unsafe_hostname_characters.replace_all(hostname, "")
 }
 
@@ -195,20 +196,9 @@ struct Config {
     tls: Option<TlsConfig>,
     /// Rate limiting configuration
     limits: Option<Limits>,
-    /// Mesh network configuration
-    mesh: Option<MeshConfig>,
     #[cfg(feature = "metrics")]
     /// Metrics serve address. If not set, metrics are not served.
     metrics_addr: Option<SocketAddr>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct MeshConfig {
-    /// Path to file containing the mesh pre-shared key file. It should contain some hex string; whitespace is trimmed.
-    mesh_psk_file: PathBuf,
-    /// Comma-separated list of urls to mesh with. Must also include the scheme ('http' or
-    /// 'https').
-    mesh_with: Vec<Url>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -219,7 +209,7 @@ struct TlsConfig {
     cert_mode: CertMode,
     /// Whether to use the LetsEncrypt production or staging server.
     ///
-    /// While in developement, LetsEncrypt prefers you to use the staging server. However, the staging server seems to
+    /// While in development, LetsEncrypt prefers you to use the staging server. However, the staging server seems to
     /// only use `ECDSA` keys. In their current set up, you can only get intermediate certificates
     /// for `ECDSA` keys if you are on their "allowlist". The production server uses `RSA` keys,
     /// which allow for issuing intermediate certificates in all normal circumstances.
@@ -250,14 +240,13 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             secret_key: SecretKey::generate(),
-            addr: "[::]:443".parse().unwrap(),
+            addr: (Ipv6Addr::UNSPECIFIED, 443).into(),
             stun_port: DEFAULT_DERP_STUN_PORT,
             hostname: NA_DERP_HOSTNAME.into(),
             enable_stun: true,
             enable_derp: true,
             tls: None,
             limits: None,
-            mesh: None,
             #[cfg(feature = "metrics")]
             metrics_addr: None,
         }
@@ -401,26 +390,10 @@ async fn run(
     }
 
     // set up derp configuration details
-    let (secret_key, mesh_key, mesh_derpers) = match cfg.enable_derp {
-        true => {
-            let (mesh_key, mesh_derpers) = if let Some(mesh_config) = cfg.mesh {
-                let raw = tokio::fs::read_to_string(mesh_config.mesh_psk_file)
-                    .await
-                    .context("reading mesh-pks file")?;
-                let mut mesh_key = [0u8; 32];
-                hex::decode_to_slice(raw.trim(), &mut mesh_key)
-                    .context("invalid mesh-pks content")?;
-                info!("DERP mesh key configured");
-                (
-                    Some(mesh_key),
-                    Some(MeshAddrs::Addrs(mesh_config.mesh_with)),
-                )
-            } else {
-                (None, None)
-            };
-            (Some(cfg.secret_key), mesh_key, mesh_derpers)
-        }
-        false => (None, None, None),
+    let secret_key = if cfg.enable_derp {
+        Some(cfg.secret_key)
+    } else {
+        None
     };
 
     // run stun
@@ -445,7 +418,10 @@ async fn run(
                 tls_config.cert_dir.unwrap_or_else(|| PathBuf::from(".")),
             )
             .await?;
-        let headers: Vec<(&str, &str)> = TLS_HEADERS.into();
+        let mut headers = HeaderMap::new();
+        for (name, value) in TLS_HEADERS.iter() {
+            headers.insert(*name, value.parse()?);
+        }
         (
             Some(DerpTlsConfig { config, acceptor }),
             headers,
@@ -454,16 +430,14 @@ async fn run(
                 .unwrap_or(DEFAULT_CAPTIVE_PORTAL_PORT),
         )
     } else {
-        (None, Vec::new(), 0)
+        (None, HeaderMap::new(), 0)
     };
 
     let mut builder = DerpServerBuilder::new(addr)
         .secret_key(secret_key.map(Into::into))
-        .mesh_key(mesh_key)
         .headers(headers)
         .tls_config(tls_config.clone())
         .derp_override(Box::new(derp_disabled_handler))
-        .mesh_derpers(mesh_derpers)
         .request_handler(Method::GET, "/", Box::new(root_handler))
         .request_handler(Method::GET, "/index.html", Box::new(root_handler))
         .request_handler(Method::GET, "/derp/probe", Box::new(probe_handler))
@@ -593,8 +567,8 @@ impl hyper::service::Service<Request<Incoming>> for CaptivePortalService {
                 let r = Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(NOTFOUND.into())
-                    .unwrap();
-                Box::pin(async move { Ok(r) })
+                    .map_err(|err| Box::new(err) as HyperError);
+                Box::pin(async move { r })
             }
         }
     }
@@ -604,23 +578,21 @@ fn derp_disabled_handler(
     _r: Request<Incoming>,
     response: ResponseBuilder,
 ) -> HyperResult<Response<BytesBody>> {
-    Ok(response
+    response
         .status(StatusCode::NOT_FOUND)
         .body(DERP_DISABLED.into())
-        .unwrap())
+        .map_err(|err| Box::new(err) as HyperError)
 }
 
 fn root_handler(
     _r: Request<Incoming>,
     response: ResponseBuilder,
 ) -> HyperResult<Response<BytesBody>> {
-    let response = response
+    response
         .status(StatusCode::OK)
         .header("Content-Type", "text/html; charset=utf-8")
         .body(INDEX.into())
-        .unwrap();
-
-    Ok(response)
+        .map_err(|err| Box::new(err) as HyperError)
 }
 
 /// HTTP latency queries
@@ -628,23 +600,21 @@ fn probe_handler(
     _r: Request<Incoming>,
     response: ResponseBuilder,
 ) -> HyperResult<Response<BytesBody>> {
-    let response = response
+    response
         .status(StatusCode::OK)
         .header("Access-Control-Allow-Origin", "*")
         .body(body_empty())
-        .unwrap();
-
-    Ok(response)
+        .map_err(|err| Box::new(err) as HyperError)
 }
 
 fn robots_handler(
     _r: Request<Incoming>,
     response: ResponseBuilder,
 ) -> HyperResult<Response<BytesBody>> {
-    Ok(response
+    response
         .status(StatusCode::OK)
         .body(ROBOTS_TXT.into())
-        .unwrap())
+        .map_err(|err| Box::new(err) as HyperError)
 }
 
 /// For captive portal detection.
@@ -667,10 +637,10 @@ fn serve_no_content_handler<B: hyper::body::Body>(
         }
     }
 
-    Ok(response
+    response
         .status(StatusCode::NO_CONTENT)
-        .body(http_body_util::Full::new(hyper::body::Bytes::new()))
-        .unwrap())
+        .body(body_empty())
+        .map_err(|err| Box::new(err) as HyperError)
 }
 
 fn is_challenge_char(c: char) -> bool {
@@ -715,14 +685,20 @@ async fn server_stun_listener(sock: UdpSocket) {
                     }
                     match tokio::task::spawn_blocking(move || stun::parse_binding_request(&pkt))
                         .await
-                        .unwrap()
                     {
-                        Ok(txid) => {
+                        Ok(Ok(txid)) => {
                             debug!(%src_addr, %txid, "STUN: received binding request");
-                            let res =
-                                tokio::task::spawn_blocking(move || stun::response(txid, src_addr))
-                                    .await
-                                    .unwrap();
+                            let res = match tokio::task::spawn_blocking(move || {
+                                stun::response(txid, src_addr)
+                            })
+                            .await
+                            {
+                                Ok(res) => res,
+                                Err(err) => {
+                                    error!("JoinError: {err:#}");
+                                    return;
+                                }
+                            };
                             match sock.send_to(&res, src_addr).await {
                                 Ok(len) => {
                                     if len != res.len() {
@@ -744,10 +720,11 @@ async fn server_stun_listener(sock: UdpSocket) {
                                 }
                             }
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             inc!(StunMetrics, bad_requests);
                             warn!(%src_addr, "STUN: invalid binding request: {:?}", err);
                         }
+                        Err(err) => error!("JoinError parsing STUN binding: {err:#}"),
                     }
                 });
             }
@@ -766,19 +743,6 @@ async fn server_stun_listener(sock: UdpSocket) {
 // 		return nil
 // 	}
 // 	return errors.New("invalid hostname")
-// }
-
-// func defaultMeshPSKFile() string {
-// 	try := []string{
-// 		"/home/derp/keys/derp-mesh.key",
-// 		filepath.Join(os.Getenv("HOME"), "keys", "derp-mesh.key"),
-// 	}
-// 	for _, p := range try {
-// 		if _, err := os.Stat(p); err == nil {
-// 			return p
-// 		}
-// 	}
-// 	return ""
 // }
 
 // func rateLimitedListenAndServeTLS(srv *http.Server) error {
@@ -899,6 +863,7 @@ mod tests {
     use anyhow::Result;
     use bytes::Bytes;
     use http_body_util::BodyExt;
+    use iroh_base::node_addr::DerpUrl;
     use iroh_net::derp::http::ClientBuilder;
     use iroh_net::derp::ReceivedMessage;
     use iroh_net::key::SecretKey;
@@ -967,7 +932,7 @@ mod tests {
 
         let derper_addr = addr_recv.await?;
         let derper_str_url = format!("http://{}", derper_addr);
-        let derper_url: Url = derper_str_url.parse().unwrap();
+        let derper_url: DerpUrl = derper_str_url.parse().unwrap();
 
         // set up clients
         let a_secret_key = SecretKey::generate();

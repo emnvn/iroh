@@ -21,9 +21,11 @@ pub fn default_derp_map() -> DerpMap {
 /// Get the default [`DerpNode`] for NA.
 pub fn default_na_derp_node() -> DerpNode {
     // The default NA derper run by number0.
-    let url: Url = format!("https://{NA_DERP_HOSTNAME}").parse().unwrap();
+    let url: Url = format!("https://{NA_DERP_HOSTNAME}")
+        .parse()
+        .expect("default url");
     DerpNode {
-        url: url.clone(),
+        url: url.into(),
         stun_only: false,
         stun_port: DEFAULT_DERP_STUN_PORT,
     }
@@ -32,9 +34,11 @@ pub fn default_na_derp_node() -> DerpNode {
 /// Get the default [`DerpNode`] for EU.
 pub fn default_eu_derp_node() -> DerpNode {
     // The default EU derper run by number0.
-    let url: Url = format!("https://{EU_DERP_HOSTNAME}").parse().unwrap();
+    let url: Url = format!("https://{EU_DERP_HOSTNAME}")
+        .parse()
+        .expect("default_url");
     DerpNode {
-        url: url.clone(),
+        url: url.into(),
         stun_only: false,
         stun_port: DEFAULT_DERP_STUN_PORT,
     }

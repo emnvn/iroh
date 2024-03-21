@@ -23,10 +23,10 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use url::Url;
 
-use crate::{key, net::ip::to_canonical};
+use crate::{derp::DerpUrl, key, net::ip::to_canonical};
 
 use super::{key::PublicKey, stun};
 
@@ -138,7 +138,7 @@ pub enum SendAddr {
     /// UDP, the ip addr.
     Udp(SocketAddr),
     /// Derp Url.
-    Derp(Url),
+    Derp(DerpUrl),
 }
 
 impl SendAddr {
@@ -148,7 +148,7 @@ impl SendAddr {
     }
 
     /// Returns the `Some(Url)` if it is a derp addr.
-    pub fn derp_url(&self) -> Option<Url> {
+    pub fn derp_url(&self) -> Option<DerpUrl> {
         match self {
             Self::Derp(url) => Some(url.clone()),
             Self::Udp(_) => None,
@@ -185,7 +185,7 @@ impl Display for SendAddr {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallMeMaybe {
     /// What the peer believes its endpoints are.
-    pub my_number: Vec<SocketAddr>,
+    pub my_numbers: Vec<SocketAddr>,
 }
 
 impl Ping {
@@ -193,7 +193,7 @@ impl Ping {
         ensure!(ver == V0, "invalid version");
         // Deliberately lax on longer-than-expected messages, for future compatibility.
         ensure!(p.len() >= PING_LEN, "message too short");
-        let tx_id: [u8; TX_LEN] = p[..TX_LEN].try_into().unwrap();
+        let tx_id: [u8; TX_LEN] = p[..TX_LEN].try_into().expect("length checked");
         let raw_key = &p[TX_LEN..TX_LEN + key::PUBLIC_KEY_LENGTH];
         let node_key = PublicKey::try_from(raw_key)?;
         let tx_id = stun::TransactionId::from(tx_id);
@@ -217,14 +217,14 @@ fn send_addr_from_bytes(p: &[u8]) -> Result<SendAddr> {
     ensure!(p.len() > 2, "too short");
     match p[0] {
         0u8 => {
-            ensure!(p.len() - 1 == EP_LENGTH, "invalid length");
-            let addr = socket_addr_from_bytes(&p[1..]);
+            let bytes: [u8; EP_LENGTH] = p[1..].try_into().context("invalid length")?;
+            let addr = socket_addr_from_bytes(bytes);
             Ok(SendAddr::Udp(addr))
         }
         1u8 => {
             let s = std::str::from_utf8(&p[1..])?;
             let u: Url = s.parse()?;
-            Ok(SendAddr::Derp(u))
+            Ok(SendAddr::Derp(u.into()))
         }
         _ => {
             bail!("invalid addr type {}", p[0]);
@@ -248,11 +248,11 @@ fn send_addr_to_vec(addr: &SendAddr) -> Vec<u8> {
 }
 
 // Assumes p.len() == EP_LENGTH
-fn socket_addr_from_bytes(p: &[u8]) -> SocketAddr {
-    debug_assert_eq!(p.len(), EP_LENGTH);
+fn socket_addr_from_bytes(p: [u8; EP_LENGTH]) -> SocketAddr {
+    debug_assert_eq!(EP_LENGTH, 16 + 2);
 
-    let raw_src_ip: [u8; 16] = p[..16].try_into().unwrap();
-    let raw_port: [u8; 2] = p[16..].try_into().unwrap();
+    let raw_src_ip: [u8; 16] = p[..16].try_into().expect("array long enough");
+    let raw_port: [u8; 2] = p[16..].try_into().expect("array long enough");
 
     let src_ip = to_canonical(IpAddr::from(raw_src_ip));
     let src_port = u16::from_le_bytes(raw_port);
@@ -275,8 +275,7 @@ fn socket_addr_as_bytes(addr: &SocketAddr) -> [u8; EP_LENGTH] {
 impl Pong {
     fn from_bytes(ver: u8, p: &[u8]) -> Result<Self> {
         ensure!(ver == V0, "invalid version");
-        ensure!(p.len() >= TX_LEN, "message too short");
-        let tx_id: [u8; TX_LEN] = p[..TX_LEN].try_into().unwrap();
+        let tx_id: [u8; TX_LEN] = p[..TX_LEN].try_into().context("message too short")?;
         let tx_id = stun::TransactionId::from(tx_id);
         let src = send_addr_from_bytes(&p[TX_LEN..])?;
 
@@ -301,12 +300,13 @@ impl CallMeMaybe {
 
         let num_entries = p.len() / EP_LENGTH;
         let mut m = CallMeMaybe {
-            my_number: Vec::with_capacity(num_entries),
+            my_numbers: Vec::with_capacity(num_entries),
         };
 
         for chunk in p.chunks_exact(EP_LENGTH) {
-            let src = socket_addr_from_bytes(chunk);
-            m.my_number.push(src);
+            let bytes: [u8; EP_LENGTH] = chunk.try_into().context("chunk must match")?;
+            let src = socket_addr_from_bytes(bytes);
+            m.my_numbers.push(src);
         }
 
         Ok(m)
@@ -314,11 +314,11 @@ impl CallMeMaybe {
 
     fn as_bytes(&self) -> Vec<u8> {
         let header = msg_header(MessageType::CallMeMaybe, V0);
-        let mut out = vec![0u8; HEADER_LEN + self.my_number.len() * EP_LENGTH];
+        let mut out = vec![0u8; HEADER_LEN + self.my_numbers.len() * EP_LENGTH];
         out[..HEADER_LEN].copy_from_slice(&header);
 
         for (m, chunk) in self
-            .my_number
+            .my_numbers
             .iter()
             .zip(out[HEADER_LEN..].chunks_exact_mut(EP_LENGTH))
         {
@@ -335,7 +335,7 @@ impl Message {
     pub fn from_bytes(p: &[u8]) -> Result<Self> {
         ensure!(p.len() >= 2, "message too short");
 
-        let t = MessageType::try_from(p[0]).map_err(|v| anyhow!("unkown message type: {}", v))?;
+        let t = MessageType::try_from(p[0]).map_err(|v| anyhow!("unknown message type: {}", v))?;
         let ver = p[1];
         let p = &p[2..];
         match t {
@@ -425,13 +425,13 @@ mod tests {
             },
             Test {
                 name: "call_me_maybe",
-                m: Message::CallMeMaybe(CallMeMaybe { my_number: Vec::new() }),
+                m: Message::CallMeMaybe(CallMeMaybe { my_numbers: Vec::new() }),
                 want: "03 00",
             },
             Test {
                 name: "call_me_maybe_endpoints",
                 m: Message::CallMeMaybe(CallMeMaybe {
-                    my_number: vec![
+                    my_numbers: vec![
                         "1.2.3.4:567".parse().unwrap(),
                         "[2001::3456]:789".parse().unwrap(),
                     ],

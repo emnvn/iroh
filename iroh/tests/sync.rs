@@ -16,7 +16,6 @@ use iroh::{
 use iroh_net::key::{PublicKey, SecretKey};
 use quic_rpc::transport::misc::DummyServerEndpoint;
 use rand::{CryptoRng, Rng, SeedableRng};
-use tokio_util::task::LocalPoolHandle;
 use tracing::{debug, info};
 use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -32,17 +31,14 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 fn test_node(
     secret_key: SecretKey,
 ) -> Builder<iroh_bytes::store::mem::Store, store::memory::Store, DummyServerEndpoint> {
-    let db = iroh_bytes::store::mem::Store::new();
-    let store = iroh_sync::store::memory::Store::default();
-    Node::builder(db, store)
-        .local_pool(&LocalPoolHandle::new(1))
+    Node::memory()
         .secret_key(secret_key)
         .derp_mode(DerpMode::Disabled)
 }
 
 // The function is not `async fn` so that we can take a `&mut` borrow on the `rng` without
 // capturing that `&mut` lifetime in the returned future. This allows to call it in a loop while
-// still collecting the futures before awaiting them alltogether (see [`spawn_nodes`])
+// still collecting the futures before awaiting them altogether (see [`spawn_nodes`])
 fn spawn_node(
     i: usize,
     rng: &mut (impl CryptoRng + Rng),
@@ -239,7 +235,10 @@ async fn sync_full_basic() -> Result<()> {
     let mut rng = test_rng(b"sync_full_basic");
     setup_logging();
     let mut nodes = spawn_nodes(2, &mut rng).await?;
-    let mut clients = nodes.iter().map(|node| node.client()).collect::<Vec<_>>();
+    let mut clients = nodes
+        .iter()
+        .map(|node| node.client().clone())
+        .collect::<Vec<_>>();
 
     // peer0: create doc and ticket
     let peer0 = nodes[0].node_id();
@@ -322,12 +321,12 @@ async fn sync_full_basic() -> Result<()> {
 
     // Note: If we could check gossip messages directly here (we can't easily), we would notice
     // that peer1 will receive a `Op::ContentReady` gossip message, broadcast
-    // by peer0 with neighbor scope. This message is superflous, and peer0 could know that, however
+    // by peer0 with neighbor scope. This message is superfluous, and peer0 could know that, however
     // our gossip implementation does not allow us to filter message receivers this way.
 
     info!("peer2: spawn");
     nodes.push(spawn_node(nodes.len(), &mut rng).await?);
-    clients.push(nodes.last().unwrap().client());
+    clients.push(nodes.last().unwrap().client().clone());
     let doc2 = clients[2].docs.import(ticket).await?;
     let peer2 = nodes[2].node_id();
     let mut events2 = doc2.subscribe().await?;
@@ -859,9 +858,7 @@ impl PartialEq<ExpectedEntry> for (Entry, Bytes) {
 
 #[tokio::test]
 async fn doc_delete() -> Result<()> {
-    let db = iroh_bytes::store::mem::Store::new();
-    let store = iroh_sync::store::memory::Store::default();
-    let node = Node::builder(db, store)
+    let node = Node::memory()
         .gc_policy(iroh::node::GcPolicy::Interval(Duration::from_millis(100)))
         .spawn()
         .await?;
