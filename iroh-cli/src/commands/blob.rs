@@ -16,15 +16,15 @@ use indicatif::{
 use iroh::bytes::{
     get::{db::DownloadProgress, Stats},
     provider::AddProgress,
-    store::{ValidateLevel, ValidateProgress},
+    store::{ExportFormat, ExportMode, ValidateLevel, ValidateProgress},
     BlobFormat, Hash, HashAndFormat, Tag,
 };
-use iroh::net::{derp::DerpUrl, key::PublicKey, NodeAddr};
+use iroh::net::{key::PublicKey, relay::RelayUrl, NodeAddr};
 use iroh::{
     client::{BlobStatus, Iroh, ShareTicketOptions},
     rpc_protocol::{
         BlobDownloadRequest, BlobListCollectionsResponse, BlobListIncompleteResponse,
-        BlobListResponse, DownloadLocation, ProviderService, SetTagOption, WrapOption,
+        BlobListResponse, ProviderService, SetTagOption, WrapOption,
     },
     ticket::BlobTicket,
 };
@@ -55,9 +55,9 @@ pub enum BlobCommands {
         /// Additional socket address to use to contact the node. Can be used multiple times.
         #[clap(long)]
         address: Vec<SocketAddr>,
-        /// Override the Derp URL to use to contact the node.
+        /// Override the relay URL to use to contact the node.
         #[clap(long)]
-        derp_url: Option<DerpUrl>,
+        relay_url: Option<RelayUrl>,
         /// Override to treat the blob as a raw blob or a hash sequence.
         #[clap(long)]
         recursive: Option<bool>,
@@ -81,6 +81,23 @@ pub enum BlobCommands {
         /// Tag to tag the data with.
         #[clap(long)]
         tag: Option<String>,
+    },
+    /// Export a blob from the internal blob store to the local filesystem.
+    Export {
+        /// The hash to export.
+        hash: Hash,
+        /// Directory or file in which to save the file(s).
+        ///
+        /// If set to `STDOUT` the output will be redirected to stdout.
+        out: OutputTarget,
+        /// Set to true if the hash refers to a collection and you want to export all children of
+        /// the collection.
+        #[clap(long, default_value_t = false)]
+        recursive: bool,
+        /// If set, the data will be moved to the output directory, and iroh will assume that it
+        /// will not change.
+        #[clap(long, default_value_t = false)]
+        stable: bool,
     },
     /// List available content on the node.
     #[clap(subcommand)]
@@ -106,7 +123,7 @@ pub enum BlobCommands {
         /// Hash of the blob to share.
         hash: Hash,
         /// Options to configure the generated ticket.
-        #[clap(long, default_value_t = ShareTicketOptions::DerpAndAddresses)]
+        #[clap(long, default_value_t = ShareTicketOptions::RelayAndAddresses)]
         ticket_options: ShareTicketOptions,
         /// If the blob is a collection, the requester will also fetch the listed blobs.
         #[clap(long, default_value_t = false)]
@@ -146,7 +163,7 @@ impl BlobCommands {
             Self::Get {
                 ticket,
                 mut address,
-                derp_url,
+                relay_url,
                 recursive,
                 override_addresses,
                 node,
@@ -171,9 +188,9 @@ impl BlobCommands {
                             };
 
                             // prefer direct arg over ticket
-                            let derp_url = derp_url.or(info.derp_url);
+                            let relay_url = relay_url.or(info.relay_url);
 
-                            NodeAddr::from_parts(node_id, derp_url, addresses)
+                            NodeAddr::from_parts(node_id, relay_url, addresses)
                         };
 
                         // check if the blob format has an override
@@ -197,7 +214,7 @@ impl BlobCommands {
                             bail!("missing NodeId");
                         };
 
-                        let node_addr = NodeAddr::from_parts(node, derp_url, address);
+                        let node_addr = NodeAddr::from_parts(node, relay_url, address);
                         (node_addr, hash, blob_format)
                     }
                 };
@@ -208,37 +225,12 @@ impl BlobCommands {
 
                 if node_addr.info.is_empty() {
                     return Err(anyhow::anyhow!(
-                        "no Derp url provided and no direct addresses provided"
+                        "no relay url provided and no direct addresses provided"
                     ));
                 }
                 let tag = match tag {
                     Some(tag) => SetTagOption::Named(Tag::from(tag)),
                     None => SetTagOption::Auto,
-                };
-
-                let out_location = match out {
-                    None => DownloadLocation::Internal,
-                    Some(OutputTarget::Stdout) => DownloadLocation::Internal,
-                    Some(OutputTarget::Path(ref path)) => {
-                        let absolute = std::env::current_dir()?.join(path);
-                        match format {
-                            BlobFormat::HashSeq => {
-                                // no validation necessary for now
-                            }
-                            BlobFormat::Raw => {
-                                ensure!(!absolute.is_dir(), "output must not be a directory");
-                            }
-                        }
-                        tracing::info!(
-                            "output path is {} -> {}",
-                            path.display(),
-                            absolute.display()
-                        );
-                        DownloadLocation::External {
-                            path: absolute,
-                            in_place: stable,
-                        }
-                    }
                 };
 
                 let mut stream = iroh
@@ -247,20 +239,81 @@ impl BlobCommands {
                         hash,
                         format,
                         peer: node_addr,
-                        out: out_location,
                         tag,
                     })
                     .await?;
 
                 show_download_progress(hash, &mut stream).await?;
 
-                // we asserted above that `OutputTarget::Stdout` is only permitted if getting a
-                // single hash and not a hashseq.
-                if out == Some(OutputTarget::Stdout) {
-                    let mut blob_read = iroh.blobs.read(hash).await?;
-                    tokio::io::copy(&mut blob_read, &mut tokio::io::stdout()).await?;
-                }
+                match out {
+                    None => {}
+                    Some(OutputTarget::Stdout) => {
+                        // we asserted above that `OutputTarget::Stdout` is only permitted if getting a
+                        // single hash and not a hashseq.
+                        let mut blob_read = iroh.blobs.read(hash).await?;
+                        tokio::io::copy(&mut blob_read, &mut tokio::io::stdout()).await?;
+                    }
+                    Some(OutputTarget::Path(path)) => {
+                        let absolute = std::env::current_dir()?.join(&path);
+                        if matches!(format, BlobFormat::HashSeq) {
+                            ensure!(!absolute.is_dir(), "output must not be a directory");
+                        }
+                        let recursive = format == BlobFormat::HashSeq;
+                        let mode = match stable {
+                            true => ExportMode::TryReference,
+                            false => ExportMode::Copy,
+                        };
+                        let format = match recursive {
+                            true => ExportFormat::Collection,
+                            false => ExportFormat::Blob,
+                        };
+                        tracing::info!("exporting to {} -> {}", path.display(), absolute.display());
+                        let stream = iroh.blobs.export(hash, absolute, format, mode).await?;
+                        // TODO: report export progress
+                        stream.await?;
+                    }
+                };
 
+                Ok(())
+            }
+            Self::Export {
+                hash,
+                out,
+                recursive,
+                stable,
+            } => {
+                match out {
+                    OutputTarget::Stdout => {
+                        ensure!(
+                            !recursive,
+                            "Recursive option is not supported when exporting to STDOUT"
+                        );
+                        let mut blob_read = iroh.blobs.read(hash).await?;
+                        tokio::io::copy(&mut blob_read, &mut tokio::io::stdout()).await?;
+                    }
+                    OutputTarget::Path(path) => {
+                        let absolute = std::env::current_dir()?.join(&path);
+                        if !recursive {
+                            ensure!(!absolute.is_dir(), "output must not be a directory");
+                        }
+                        let mode = match stable {
+                            true => ExportMode::TryReference,
+                            false => ExportMode::Copy,
+                        };
+                        let format = match recursive {
+                            true => ExportFormat::Collection,
+                            false => ExportFormat::Blob,
+                        };
+                        tracing::info!(
+                            "exporting {hash} to {} -> {}",
+                            path.display(),
+                            absolute.display()
+                        );
+                        let stream = iroh.blobs.export(hash, absolute, format, mode).await?;
+                        // TODO: report export progress
+                        stream.await?;
+                    }
+                };
                 Ok(())
             }
             Self::List(cmd) => cmd.run(iroh).await,
@@ -896,7 +949,7 @@ pub async fn show_download_progress(
             DownloadProgress::Done { .. } => {
                 ip.finish_and_clear();
             }
-            DownloadProgress::NetworkDone(Stats {
+            DownloadProgress::AllDone(Stats {
                 bytes_read,
                 elapsed,
                 ..
@@ -908,15 +961,10 @@ pub async fn show_download_progress(
                     HumanDuration(elapsed),
                     HumanBytes((bytes_read as f64 / elapsed.as_secs_f64()) as u64)
                 );
+                break;
             }
             DownloadProgress::Abort(e) => {
                 bail!("download aborted: {:?}", e);
-            }
-            DownloadProgress::Export(_p) => {
-                // TODO: report export progress
-            }
-            DownloadProgress::AllDone => {
-                break;
             }
         }
     }

@@ -100,7 +100,7 @@ mod validate;
 use crate::{
     store::{
         bao_file::{BaoFileStorage, CompleteStorage},
-        file::{
+        fs::{
             tables::BaoFilePart,
             util::{overwrite_and_sync, read_and_remove, ProgressReader},
         },
@@ -716,7 +716,7 @@ impl Store {
     /// Load or create a new store.
     pub async fn load(root: impl AsRef<Path>) -> io::Result<Self> {
         let path = root.as_ref();
-        let db_path = path.join("meta").join("blobs.db");
+        let db_path = path.join("blobs.db");
         let options = Options {
             path: PathOptions::new(path),
             inline: Default::default(),
