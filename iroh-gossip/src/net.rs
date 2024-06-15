@@ -30,17 +30,18 @@ pub mod util;
 pub const GOSSIP_ALPN: &[u8] = b"/iroh-gossip/0";
 
 /// Channel capacity for all subscription broadcast channels (single)
-const SUBSCRIBE_ALL_CAP: usize = 8192; //old: 4096
+const SUBSCRIBE_ALL_CAP: usize = 4096;
 /// Channel capacity for topic subscription broadcast channels (one per topic)
-const SUBSCRIBE_TOPIC_CAP: usize = 8192; //old: 4096
+const SUBSCRIBE_TOPIC_CAP: usize = 4096;
 /// Channel capacity for the send queue (one per connection)
-const SEND_QUEUE_CAP: usize = 512; //old: 64
+const SEND_QUEUE_CAP: usize = 64;
 /// Channel capacity for the ToActor message queue (single)
-const TO_ACTOR_CAP: usize = 512; //old: 64
+const TO_ACTOR_CAP: usize = 64;
 /// Channel capacity for the InEvent message queue (single)
-const IN_EVENT_CAP: usize = 8192; //old: 1024
+const IN_EVENT_CAP: usize = 1024;
 /// Channel capacity for endpoint change message queue (single)
-const ON_ENDPOINTS_CAP: usize = 512; //old: 64
+const ON_ENDPOINTS_CAP: usize = 64;
+
 /// Name used for logging when new node addresses are added from gossip.
 const SOURCE_NAME: &str = "gossip";
 
