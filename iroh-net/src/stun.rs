@@ -72,8 +72,8 @@ const COOKIE: [u8; 4] = 0x2112_A442u32.to_be_bytes();
 /// Reports whether b is a STUN message.
 pub fn is(b: &[u8]) -> bool {
     b.len() >= stun_rs::MESSAGE_HEADER_SIZE &&
-	b[0]&0b11000000 == 0 && // top two bits must be zero
-	b[4..8] == COOKIE
+        b[0]&0b11000000 == 0 && // top two bits must be zero
+        b[4..8] == COOKIE
 }
 
 /// Parses a STUN binding request.
@@ -150,24 +150,23 @@ pub fn parse_response(b: &[u8]) -> Result<(TransactionId, SocketAddr), Error> {
 }
 
 #[cfg(test)]
-pub mod test {
-    use std::{
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-        sync::Arc,
-    };
+pub(crate) mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
 
-    use crate::{
-        relay::{RelayMap, RelayNode, RelayUrl},
-        test_utils::CleanupDropGuard,
-    };
-
-    use super::*;
     use anyhow::Result;
     use tokio::{
         net,
         sync::{oneshot, Mutex},
     };
     use tracing::{debug, trace};
+
+    use crate::relay::{RelayMap, RelayNode, RelayUrl};
+    use crate::test_utils::CleanupDropGuard;
+
+    use super::*;
+
+    // TODO: make all this private
 
     // (read_ipv4, read_ipv5)
     #[derive(Debug, Default, Clone)]
@@ -203,7 +202,7 @@ pub mod test {
     ///
     /// See [`serve`] for more details.
     pub(crate) async fn serve_v4() -> Result<(SocketAddr, StunStats, CleanupDropGuard)> {
-        serve(Ipv4Addr::UNSPECIFIED.into()).await
+        serve(std::net::Ipv4Addr::UNSPECIFIED.into()).await
     }
 
     /// Sets up a simple STUN server.
@@ -271,13 +270,6 @@ pub mod test {
             }
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
-
-    use super::*;
 
     // Test to check if an existing stun server works
     // #[tokio::test]

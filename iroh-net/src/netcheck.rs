@@ -166,8 +166,7 @@ impl RelayLatencies {
 /// If all [`Client`]s are dropped the actor stops running.
 ///
 /// While running the netcheck actor expects to be passed all received stun packets using
-/// [`Client::receive_stun_packet`], the [`crate::magicsock::MagicSock`] using this
-/// client needs to be wired up to do so.
+/// [`Client::receive_stun_packet`].
 #[derive(Debug, Clone)]
 pub struct Client {
     /// Channel to send message to the [`Actor`].
@@ -630,7 +629,7 @@ impl Actor {
     fn add_report_history_and_set_preferred_relay(&mut self, mut r: Report) -> Arc<Report> {
         let mut prev_relay = None;
         if let Some(ref last) = self.reports.last {
-            prev_relay = last.preferred_relay.clone();
+            prev_relay.clone_from(&last.preferred_relay);
         }
         let now = Instant::now();
         const MAX_AGE: Duration = Duration::from_secs(5 * 60);
@@ -786,8 +785,7 @@ mod tests {
     use tokio::time;
     use tracing::info;
 
-    use crate::defaults::{DEFAULT_RELAY_STUN_PORT, EU_RELAY_HOSTNAME};
-    use crate::net::IpFamily;
+    use crate::defaults::{DEFAULT_STUN_PORT, EU_RELAY_HOSTNAME};
     use crate::ping::Pinger;
     use crate::relay::RelayNode;
 
@@ -797,11 +795,11 @@ mod tests {
     async fn test_basic() -> Result<()> {
         let _guard = iroh_test::logging::setup();
         let (stun_addr, stun_stats, _cleanup_guard) =
-            stun::test::serve("0.0.0.0".parse().unwrap()).await?;
+            stun::tests::serve("127.0.0.1".parse().unwrap()).await?;
 
         let resolver = crate::dns::default_resolver();
         let mut client = Client::new(None, resolver.clone())?;
-        let dm = stun::test::relay_map_of([stun_addr].into_iter());
+        let dm = stun::tests::relay_map_of([stun_addr].into_iter());
 
         // Note that the ProbePlan will change with each iteration.
         for i in 0..5 {
@@ -844,7 +842,7 @@ mod tests {
         let dm = RelayMap::from_nodes([RelayNode {
             url: url.clone(),
             stun_only: true,
-            stun_port: DEFAULT_RELAY_STUN_PORT,
+            stun_port: DEFAULT_STUN_PORT,
         }])
         .expect("hardcoded");
 
@@ -892,7 +890,7 @@ mod tests {
         // the STUN server being blocked will look like from the client's perspective.
         let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
         let stun_addr = blackhole.local_addr()?;
-        let dm = stun::test::relay_map_of_opts([(stun_addr, false)].into_iter());
+        let dm = stun::tests::relay_map_of_opts([(stun_addr, false)].into_iter());
 
         // Now create a client and generate a report.
         let resolver = crate::dns::default_resolver().clone();
@@ -1129,8 +1127,8 @@ mod tests {
         // can easily use to identify the packet.
 
         // Setup STUN server and create relay_map.
-        let (stun_addr, _stun_stats, _done) = stun::test::serve_v4().await?;
-        let dm = stun::test::relay_map_of([stun_addr].into_iter());
+        let (stun_addr, _stun_stats, _done) = stun::tests::serve_v4().await?;
+        let dm = stun::tests::relay_map_of([stun_addr].into_iter());
         dbg!(&dm);
 
         let resolver = crate::dns::default_resolver().clone();

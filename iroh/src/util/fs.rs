@@ -11,7 +11,7 @@ use iroh_net::key::SecretKey;
 use tokio::io::AsyncWriteExt;
 use walkdir::WalkDir;
 
-use crate::rpc_protocol::WrapOption;
+use crate::client::blobs::WrapOption;
 
 /// A data source
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
@@ -337,7 +337,6 @@ pub fn canonicalized_path_to_string(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::fs::{path_content_info, PathContent};
 
     #[test]
     fn test_path_to_key_roundtrip() {

@@ -1,28 +1,22 @@
-use std::collections::BTreeMap;
+//! API to manage the iroh node itself.
+
+use std::{collections::BTreeMap, net::SocketAddr};
 
 use anyhow::Result;
-use futures::{Stream, TryStreamExt};
+use futures_lite::{Stream, StreamExt};
 use iroh_base::key::PublicKey;
-use iroh_net::magic_endpoint::ConnectionInfo;
-use quic_rpc::{RpcClient, ServiceConnection};
+use iroh_net::{endpoint::ConnectionInfo, relay::RelayUrl, NodeAddr, NodeId};
+use serde::{Deserialize, Serialize};
 
 use crate::rpc_protocol::{
-    CounterStats, NodeConnectionInfoRequest, NodeConnectionInfoResponse, NodeConnectionsRequest,
-    NodeShutdownRequest, NodeStatsRequest, NodeStatusRequest, NodeStatusResponse, ProviderService,
+    CounterStats, NodeAddrRequest, NodeConnectionInfoRequest, NodeConnectionInfoResponse,
+    NodeConnectionsRequest, NodeIdRequest, NodeRelayRequest, NodeShutdownRequest, NodeStatsRequest,
+    NodeStatusRequest,
 };
 
-use super::flatten;
+use super::{flatten, Iroh};
 
-/// Iroh node client.
-#[derive(Debug, Clone)]
-pub struct Client<C> {
-    pub(super) rpc: RpcClient<ProviderService, C>,
-}
-
-impl<C> Client<C>
-where
-    C: ServiceConnection<ProviderService>,
-{
+impl Iroh {
     /// Get statistics of the running node.
     pub async fn stats(&self) -> Result<BTreeMap<String, CounterStats>> {
         let res = self.rpc.rpc(NodeStatsRequest {}).await??;
@@ -32,7 +26,7 @@ where
     /// Get information about the different connections we have made
     pub async fn connections(&self) -> Result<impl Stream<Item = Result<ConnectionInfo>>> {
         let stream = self.rpc.server_streaming(NodeConnectionsRequest {}).await?;
-        Ok(flatten(stream).map_ok(|res| res.conn_info))
+        Ok(flatten(stream).map(|res| res.map(|res| res.conn_info)))
     }
 
     /// Get connection information about a node
@@ -44,10 +38,28 @@ where
         Ok(conn_info)
     }
 
-    /// Get status information about a node
-    pub async fn status(&self) -> Result<NodeStatusResponse> {
+    /// Get status information about a node.
+    pub async fn status(&self) -> Result<NodeStatus> {
         let response = self.rpc.rpc(NodeStatusRequest).await??;
         Ok(response)
+    }
+
+    /// Get the id of this node.
+    pub async fn node_id(&self) -> Result<NodeId> {
+        let id = self.rpc.rpc(NodeIdRequest).await??;
+        Ok(id)
+    }
+
+    /// Return the [`NodeAddr`] for this node.
+    pub async fn my_addr(&self) -> Result<NodeAddr> {
+        let addr = self.rpc.rpc(NodeAddrRequest).await??;
+        Ok(addr)
+    }
+
+    /// Get the relay server we are connected to.
+    pub async fn my_relay(&self) -> Result<Option<RelayUrl>> {
+        let relay = self.rpc.rpc(NodeRelayRequest).await??;
+        Ok(relay)
     }
 
     /// Shutdown the node.
@@ -58,4 +70,15 @@ where
         self.rpc.rpc(NodeShutdownRequest { force }).await?;
         Ok(())
     }
+}
+
+/// The response to a version request
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NodeStatus {
+    /// The node id and socket addresses of this node.
+    pub addr: NodeAddr,
+    /// The bound listening addresses of the node
+    pub listen_addrs: Vec<SocketAddr>,
+    /// The version of the node
+    pub version: String,
 }

@@ -7,50 +7,49 @@
 //! response, while others like provide have a stream of responses.
 //!
 //! Note that this is subject to change. The RPC protocol is not yet stable.
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use bytes::Bytes;
 use derive_more::{From, TryInto};
-pub use iroh_bytes::{export::ExportProgress, get::db::DownloadProgress, BlobFormat, Hash};
-use iroh_bytes::{
+use iroh_base::node_addr::AddrInfoOptions;
+pub use iroh_blobs::{export::ExportProgress, get::db::DownloadProgress, BlobFormat, Hash};
+use iroh_blobs::{
     format::collection::Collection,
     store::{BaoBlobSize, ConsistencyCheckProgress},
     util::Tag,
 };
 use iroh_net::{
+    endpoint::{ConnectionInfo, NodeAddr},
     key::PublicKey,
-    magic_endpoint::{ConnectionInfo, NodeAddr},
+    relay::RelayUrl,
+    NodeId,
 };
 
-use iroh_sync::{
+use iroh_docs::{
     actor::OpenState,
     store::{DownloadPolicy, Query},
-    PeerIdBytes, {AuthorId, CapabilityKind, Entry, NamespaceId, SignedEntry},
+    Author, AuthorId, Capability, CapabilityKind, DocTicket, Entry, NamespaceId, PeerIdBytes,
+    SignedEntry,
 };
 use quic_rpc::{
     message::{BidiStreaming, BidiStreamingMsg, Msg, RpcMsg, ServerStreaming, ServerStreamingMsg},
+    pattern::try_server_streaming::{StreamCreated, TryServerStreaming, TryServerStreamingMsg},
     Service,
 };
 use serde::{Deserialize, Serialize};
 
 pub use iroh_base::rpc::{RpcError, RpcResult};
-use iroh_bytes::store::{ExportFormat, ExportMode};
-pub use iroh_bytes::{provider::AddProgress, store::ValidateProgress};
+use iroh_blobs::store::{ExportFormat, ExportMode};
+pub use iroh_blobs::{provider::AddProgress, store::ValidateProgress};
+use iroh_docs::engine::LiveEvent;
 
-use crate::sync_engine::LiveEvent;
-pub use crate::ticket::DocTicket;
-
-/// A 32-byte key or token
-pub type KeyBytes = [u8; 32];
-
-/// Option for commands that allow setting a tag
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum SetTagOption {
-    /// A tag will be automatically generated
-    Auto,
-    /// The tag is explicitly named
-    Named(Tag),
-}
+use crate::client::{
+    blobs::{BlobInfo, DownloadMode, IncompleteBlobInfo, WrapOption},
+    docs::{ImportProgress, ShareMode},
+    tags::TagInfo,
+    NodeStatus,
+};
+pub use iroh_blobs::util::SetTagOption;
 
 /// A request to the node to provide the data at the given path
 ///
@@ -72,23 +71,11 @@ pub struct BlobAddPathRequest {
     pub wrap: WrapOption,
 }
 
-/// Whether to wrap the added data in a collection.
-#[derive(Debug, Serialize, Deserialize)]
-pub enum WrapOption {
-    /// Do not wrap the file or directory.
-    NoWrap,
-    /// Wrap the file or directory in a collection.
-    Wrap {
-        /// Override the filename in the wrapping collection.
-        name: Option<String>,
-    },
-}
-
-impl Msg<ProviderService> for BlobAddPathRequest {
+impl Msg<RpcService> for BlobAddPathRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for BlobAddPathRequest {
+impl ServerStreamingMsg<RpcService> for BlobAddPathRequest {
     type Response = BlobAddPathResponse;
 }
 
@@ -104,17 +91,24 @@ pub struct BlobDownloadRequest {
     /// If the format is [`BlobFormat::HashSeq`], all children are downloaded and shared as
     /// well.
     pub format: BlobFormat,
-    /// This mandatory field specifies the peer to download the data from.
-    pub peer: NodeAddr,
+    /// This mandatory field specifies the nodes to download the data from.
+    ///
+    /// If set to more than a single node, they will all be tried. If `mode` is set to
+    /// [`DownloadMode::Direct`], they will be tried sequentially until a download succeeds.
+    /// If `mode` is set to [`DownloadMode::Queued`], the nodes may be dialed in parallel,
+    /// if the concurrency limits permit.
+    pub nodes: Vec<NodeAddr>,
     /// Optional tag to tag the data with.
     pub tag: SetTagOption,
+    /// Whether to directly start the download or add it to the download queue.
+    pub mode: DownloadMode,
 }
 
-impl Msg<ProviderService> for BlobDownloadRequest {
+impl Msg<RpcService> for BlobDownloadRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for BlobDownloadRequest {
+impl ServerStreamingMsg<RpcService> for BlobDownloadRequest {
     type Response = BlobDownloadResponse;
 }
 
@@ -141,11 +135,11 @@ pub struct BlobExportRequest {
     pub mode: ExportMode,
 }
 
-impl Msg<ProviderService> for BlobExportRequest {
+impl Msg<RpcService> for BlobExportRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for BlobExportRequest {
+impl ServerStreamingMsg<RpcService> for BlobExportRequest {
     type Response = BlobExportResponse;
 }
 
@@ -160,11 +154,11 @@ pub struct BlobConsistencyCheckRequest {
     pub repair: bool,
 }
 
-impl Msg<ProviderService> for BlobConsistencyCheckRequest {
+impl Msg<RpcService> for BlobConsistencyCheckRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for BlobConsistencyCheckRequest {
+impl ServerStreamingMsg<RpcService> for BlobConsistencyCheckRequest {
     type Response = ConsistencyCheckProgress;
 }
 
@@ -175,11 +169,11 @@ pub struct BlobValidateRequest {
     pub repair: bool,
 }
 
-impl Msg<ProviderService> for BlobValidateRequest {
+impl Msg<RpcService> for BlobValidateRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for BlobValidateRequest {
+impl ServerStreamingMsg<RpcService> for BlobValidateRequest {
     type Response = ValidateProgress;
 }
 
@@ -187,103 +181,69 @@ impl ServerStreamingMsg<ProviderService> for BlobValidateRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BlobListRequest;
 
-/// A response to a list blobs request
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BlobListResponse {
-    /// Location of the blob
-    pub path: String,
-    /// The hash of the blob
-    pub hash: Hash,
-    /// The size of the blob
-    pub size: u64,
-}
-
-impl Msg<ProviderService> for BlobListRequest {
+impl Msg<RpcService> for BlobListRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for BlobListRequest {
-    type Response = RpcResult<BlobListResponse>;
+impl ServerStreamingMsg<RpcService> for BlobListRequest {
+    type Response = RpcResult<BlobInfo>;
 }
 
 /// List all blobs, including collections
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BlobListIncompleteRequest;
 
-/// A response to a list blobs request
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BlobListIncompleteResponse {
-    /// The size we got
-    pub size: u64,
-    /// The size we expect
-    pub expected_size: u64,
-    /// The hash of the blob
-    pub hash: Hash,
-}
-
-impl Msg<ProviderService> for BlobListIncompleteRequest {
+impl Msg<RpcService> for BlobListIncompleteRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for BlobListIncompleteRequest {
-    type Response = RpcResult<BlobListIncompleteResponse>;
+impl ServerStreamingMsg<RpcService> for BlobListIncompleteRequest {
+    type Response = RpcResult<IncompleteBlobInfo>;
 }
 
 /// List all collections
 ///
 /// Lists all collections that have been explicitly added to the database.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct BlobListCollectionsRequest;
-
-/// A response to a list collections request
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BlobListCollectionsResponse {
-    /// Tag of the collection
-    pub tag: Tag,
-
-    /// Hash of the collection
-    pub hash: Hash,
-    /// Number of children in the collection
-    ///
-    /// This is an optional field, because the data is not always available.
-    pub total_blobs_count: Option<u64>,
-    /// Total size of the raw data referred to by all links
-    ///
-    /// This is an optional field, because the data is not always available.
-    pub total_blobs_size: Option<u64>,
+pub struct ListTagsRequest {
+    /// List raw tags
+    pub raw: bool,
+    /// List hash seq tags
+    pub hash_seq: bool,
 }
 
-impl Msg<ProviderService> for BlobListCollectionsRequest {
+impl ListTagsRequest {
+    /// List all tags
+    pub fn all() -> Self {
+        Self {
+            raw: true,
+            hash_seq: true,
+        }
+    }
+
+    /// List raw tags
+    pub fn raw() -> Self {
+        Self {
+            raw: true,
+            hash_seq: false,
+        }
+    }
+
+    /// List hash seq tags
+    pub fn hash_seq() -> Self {
+        Self {
+            raw: false,
+            hash_seq: true,
+        }
+    }
+}
+
+impl Msg<RpcService> for ListTagsRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for BlobListCollectionsRequest {
-    type Response = RpcResult<BlobListCollectionsResponse>;
-}
-
-/// List all collections
-///
-/// Lists all collections that have been explicitly added to the database.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListTagsRequest;
-
-/// A response to a list collections request
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListTagsResponse {
-    /// Name of the tag
-    pub name: Tag,
-    /// Format of the data
-    pub format: BlobFormat,
-    /// Hash of the data
-    pub hash: Hash,
-}
-
-impl Msg<ProviderService> for ListTagsRequest {
-    type Pattern = ServerStreaming;
-}
-
-impl ServerStreamingMsg<ProviderService> for ListTagsRequest {
-    type Response = ListTagsResponse;
+impl ServerStreamingMsg<RpcService> for ListTagsRequest {
+    type Response = TagInfo;
 }
 
 /// Delete a blob
@@ -293,7 +253,7 @@ pub struct BlobDeleteBlobRequest {
     pub hash: Hash,
 }
 
-impl RpcMsg<ProviderService> for BlobDeleteBlobRequest {
+impl RpcMsg<RpcService> for BlobDeleteBlobRequest {
     type Response = RpcResult<()>;
 }
 
@@ -304,28 +264,9 @@ pub struct DeleteTagRequest {
     pub name: Tag,
 }
 
-impl RpcMsg<ProviderService> for DeleteTagRequest {
+impl RpcMsg<RpcService> for DeleteTagRequest {
     type Response = RpcResult<()>;
 }
-
-/// Get a collection
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BlobGetCollectionRequest {
-    /// Hash of the collection
-    pub hash: Hash,
-}
-
-impl RpcMsg<ProviderService> for BlobGetCollectionRequest {
-    type Response = RpcResult<BlobGetCollectionResponse>;
-}
-
-/// The response for a `BlobGetCollectionRequest`.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BlobGetCollectionResponse {
-    /// The collection.
-    pub collection: Collection,
-}
-
 /// Create a collection.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateCollectionRequest {
@@ -346,7 +287,7 @@ pub struct CreateCollectionResponse {
     pub tag: Tag,
 }
 
-impl RpcMsg<ProviderService> for CreateCollectionRequest {
+impl RpcMsg<RpcService> for CreateCollectionRequest {
     type Response = RpcResult<CreateCollectionResponse>;
 }
 
@@ -364,11 +305,11 @@ pub struct NodeConnectionsResponse {
     pub conn_info: ConnectionInfo,
 }
 
-impl Msg<ProviderService> for NodeConnectionsRequest {
+impl Msg<RpcService> for NodeConnectionsRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for NodeConnectionsRequest {
+impl ServerStreamingMsg<RpcService> for NodeConnectionsRequest {
     type Response = RpcResult<NodeConnectionsResponse>;
 }
 
@@ -386,7 +327,7 @@ pub struct NodeConnectionInfoResponse {
     pub conn_info: Option<ConnectionInfo>,
 }
 
-impl RpcMsg<ProviderService> for NodeConnectionInfoRequest {
+impl RpcMsg<RpcService> for NodeConnectionInfoRequest {
     type Response = RpcResult<NodeConnectionInfoResponse>;
 }
 
@@ -397,40 +338,49 @@ pub struct NodeShutdownRequest {
     pub force: bool,
 }
 
-impl RpcMsg<ProviderService> for NodeShutdownRequest {
+impl RpcMsg<RpcService> for NodeShutdownRequest {
     type Response = ();
 }
 
-/// A request to get information about the identity of the node
-///
-/// See [`NodeStatusResponse`] for the response.
+/// A request to get information about the status of the node.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NodeStatusRequest;
 
-impl RpcMsg<ProviderService> for NodeStatusRequest {
-    type Response = RpcResult<NodeStatusResponse>;
+impl RpcMsg<RpcService> for NodeStatusRequest {
+    type Response = RpcResult<NodeStatus>;
 }
 
-/// The response to a version request
+/// A request to get information the identity of the node.
 #[derive(Serialize, Deserialize, Debug)]
-pub struct NodeStatusResponse {
-    /// The node id and socket addresses of this node.
-    pub addr: NodeAddr,
-    /// The bound listening addresses of the node
-    pub listen_addrs: Vec<SocketAddr>,
-    /// The version of the node
-    pub version: String,
+pub struct NodeIdRequest;
+
+impl RpcMsg<RpcService> for NodeIdRequest {
+    type Response = RpcResult<NodeId>;
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct NodeAddrRequest;
+
+impl RpcMsg<RpcService> for NodeAddrRequest {
+    type Response = RpcResult<NodeAddr>;
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct NodeRelayRequest;
+
+impl RpcMsg<RpcService> for NodeRelayRequest {
+    type Response = RpcResult<Option<RelayUrl>>;
 }
 
 /// A request to watch for the node status
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NodeWatchRequest;
 
-impl Msg<ProviderService> for NodeWatchRequest {
+impl Msg<RpcService> for NodeWatchRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for NodeWatchRequest {
+impl ServerStreamingMsg<RpcService> for NodeWatchRequest {
     type Response = NodeWatchResponse;
 }
 
@@ -454,11 +404,11 @@ pub struct VersionResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AuthorListRequest {}
 
-impl Msg<ProviderService> for AuthorListRequest {
+impl Msg<RpcService> for AuthorListRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for AuthorListRequest {
+impl ServerStreamingMsg<RpcService> for AuthorListRequest {
     type Response = RpcResult<AuthorListResponse>;
 }
 
@@ -473,7 +423,7 @@ pub struct AuthorListResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AuthorCreateRequest;
 
-impl RpcMsg<ProviderService> for AuthorCreateRequest {
+impl RpcMsg<RpcService> for AuthorCreateRequest {
     type Response = RpcResult<AuthorCreateResponse>;
 }
 
@@ -484,14 +434,76 @@ pub struct AuthorCreateResponse {
     pub author_id: AuthorId,
 }
 
+/// Get the default author.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AuthorGetDefaultRequest;
+
+impl RpcMsg<RpcService> for AuthorGetDefaultRequest {
+    type Response = RpcResult<AuthorGetDefaultResponse>;
+}
+
+/// Response for [`AuthorGetDefaultRequest`]
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AuthorGetDefaultResponse {
+    /// The id of the author
+    pub author_id: AuthorId,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AuthorSetDefaultRequest {
+    /// The id of the author
+    pub author_id: AuthorId,
+}
+
+impl RpcMsg<RpcService> for AuthorSetDefaultRequest {
+    type Response = RpcResult<AuthorSetDefaultResponse>;
+}
+
+/// Response for [`AuthorGetDefaultRequest`]
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AuthorSetDefaultResponse;
+
+/// Delete an author
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AuthorDeleteRequest {
+    /// The id of the author to delete
+    pub author: AuthorId,
+}
+
+impl RpcMsg<RpcService> for AuthorDeleteRequest {
+    type Response = RpcResult<AuthorDeleteResponse>;
+}
+
+/// Response for [`AuthorDeleteRequest`]
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AuthorDeleteResponse;
+
+/// Exports an author
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AuthorExportRequest {
+    /// The id of the author to delete
+    pub author: AuthorId,
+}
+
+impl RpcMsg<RpcService> for AuthorExportRequest {
+    type Response = RpcResult<AuthorExportResponse>;
+}
+
+/// Response for [`AuthorExportRequest`]
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AuthorExportResponse {
+    /// The author
+    pub author: Option<Author>,
+}
+
 /// Import author from secret key
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AuthorImportRequest {
-    /// The secret key for the author
-    pub key: KeyBytes,
+    /// The author to import
+    pub author: Author,
 }
 
-impl RpcMsg<ProviderService> for AuthorImportRequest {
+impl RpcMsg<RpcService> for AuthorImportRequest {
     type Response = RpcResult<AuthorImportResponse>;
 }
 
@@ -502,15 +514,6 @@ pub struct AuthorImportResponse {
     pub author_id: AuthorId,
 }
 
-/// Intended capability for document share tickets
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum ShareMode {
-    /// Read-only access
-    Read,
-    /// Write access
-    Write,
-}
-
 /// Subscribe to events for a document.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DocSubscribeRequest {
@@ -518,12 +521,14 @@ pub struct DocSubscribeRequest {
     pub doc_id: NamespaceId,
 }
 
-impl Msg<ProviderService> for DocSubscribeRequest {
-    type Pattern = ServerStreaming;
+impl Msg<RpcService> for DocSubscribeRequest {
+    type Pattern = TryServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for DocSubscribeRequest {
-    type Response = RpcResult<DocSubscribeResponse>;
+impl TryServerStreamingMsg<RpcService> for DocSubscribeRequest {
+    type Item = DocSubscribeResponse;
+    type ItemError = RpcError;
+    type CreateError = RpcError;
 }
 
 /// Response to [`DocSubscribeRequest`]
@@ -537,11 +542,11 @@ pub struct DocSubscribeResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DocListRequest {}
 
-impl Msg<ProviderService> for DocListRequest {
+impl Msg<RpcService> for DocListRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for DocListRequest {
+impl ServerStreamingMsg<RpcService> for DocListRequest {
     type Response = RpcResult<DocListResponse>;
 }
 
@@ -558,7 +563,7 @@ pub struct DocListResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DocCreateRequest {}
 
-impl RpcMsg<ProviderService> for DocCreateRequest {
+impl RpcMsg<RpcService> for DocCreateRequest {
     type Response = RpcResult<DocCreateResponse>;
 }
 
@@ -569,11 +574,14 @@ pub struct DocCreateResponse {
     pub id: NamespaceId,
 }
 
-/// Import a document from a ticket.
+/// Import a document from a capability.
 #[derive(Serialize, Deserialize, Debug)]
-pub struct DocImportRequest(pub DocTicket);
+pub struct DocImportRequest {
+    /// The namespace capability.
+    pub capability: Capability,
+}
 
-impl RpcMsg<ProviderService> for DocImportRequest {
+impl RpcMsg<RpcService> for DocImportRequest {
     type Response = RpcResult<DocImportResponse>;
 }
 
@@ -591,9 +599,11 @@ pub struct DocShareRequest {
     pub doc_id: NamespaceId,
     /// Whether to share read or write access to the document
     pub mode: ShareMode,
+    /// Configuration of the addresses in the ticket.
+    pub addr_options: AddrInfoOptions,
 }
 
-impl RpcMsg<ProviderService> for DocShareRequest {
+impl RpcMsg<RpcService> for DocShareRequest {
     type Response = RpcResult<DocShareResponse>;
 }
 
@@ -608,7 +618,7 @@ pub struct DocStatusRequest {
     pub doc_id: NamespaceId,
 }
 
-impl RpcMsg<ProviderService> for DocStatusRequest {
+impl RpcMsg<RpcService> for DocStatusRequest {
     type Response = RpcResult<DocStatusResponse>;
 }
 
@@ -627,7 +637,7 @@ pub struct DocOpenRequest {
     pub doc_id: NamespaceId,
 }
 
-impl RpcMsg<ProviderService> for DocOpenRequest {
+impl RpcMsg<RpcService> for DocOpenRequest {
     type Response = RpcResult<DocOpenResponse>;
 }
 
@@ -642,7 +652,7 @@ pub struct DocCloseRequest {
     pub doc_id: NamespaceId,
 }
 
-impl RpcMsg<ProviderService> for DocCloseRequest {
+impl RpcMsg<RpcService> for DocCloseRequest {
     type Response = RpcResult<DocCloseResponse>;
 }
 
@@ -659,7 +669,7 @@ pub struct DocStartSyncRequest {
     pub peers: Vec<NodeAddr>,
 }
 
-impl RpcMsg<ProviderService> for DocStartSyncRequest {
+impl RpcMsg<RpcService> for DocStartSyncRequest {
     type Response = RpcResult<DocStartSyncResponse>;
 }
 
@@ -674,7 +684,7 @@ pub struct DocLeaveRequest {
     pub doc_id: NamespaceId,
 }
 
-impl RpcMsg<ProviderService> for DocLeaveRequest {
+impl RpcMsg<RpcService> for DocLeaveRequest {
     type Response = RpcResult<DocLeaveResponse>;
 }
 
@@ -689,7 +699,7 @@ pub struct DocDropRequest {
     pub doc_id: NamespaceId,
 }
 
-impl RpcMsg<ProviderService> for DocDropRequest {
+impl RpcMsg<RpcService> for DocDropRequest {
     type Response = RpcResult<DocDropResponse>;
 }
 
@@ -712,7 +722,7 @@ pub struct DocSetRequest {
     pub value: Bytes,
 }
 
-impl RpcMsg<ProviderService> for DocSetRequest {
+impl RpcMsg<RpcService> for DocSetRequest {
     type Response = RpcResult<DocSetResponse>;
 }
 
@@ -725,7 +735,7 @@ pub struct DocSetResponse {
 
 /// A request to the node to add the data at the given filepath as an entry to the document
 ///
-/// Will produce a stream of [`DocImportProgress`] messages.
+/// Will produce a stream of [`ImportProgress`] messages.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DocImportFileRequest {
     /// The document id
@@ -745,57 +755,17 @@ pub struct DocImportFileRequest {
     pub in_place: bool,
 }
 
-impl Msg<ProviderService> for DocImportFileRequest {
+impl Msg<RpcService> for DocImportFileRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for DocImportFileRequest {
+impl ServerStreamingMsg<RpcService> for DocImportFileRequest {
     type Response = DocImportFileResponse;
 }
 
-/// Wrapper around [`DocImportProgress`].
+/// Wrapper around [`ImportProgress`].
 #[derive(Debug, Serialize, Deserialize, derive_more::Into)]
-pub struct DocImportFileResponse(pub DocImportProgress);
-
-/// Progress messages for an doc import operation
-///
-/// An import operation involves computing the outboard of a file, and then
-/// either copying or moving the file into the database, then setting the author, hash, size, and tag of that file as an entry in the doc
-#[derive(Debug, Serialize, Deserialize)]
-pub enum DocImportProgress {
-    /// An item was found with name `name`, from now on referred to via `id`
-    Found {
-        /// A new unique id for this entry.
-        id: u64,
-        /// The name of the entry.
-        name: String,
-        /// The size of the entry in bytes.
-        size: u64,
-    },
-    /// We got progress ingesting item `id`.
-    Progress {
-        /// The unique id of the entry.
-        id: u64,
-        /// The offset of the progress, in bytes.
-        offset: u64,
-    },
-    /// We are done adding `id` to the data store and the hash is `hash`.
-    IngestDone {
-        /// The unique id of the entry.
-        id: u64,
-        /// The hash of the entry.
-        hash: Hash,
-    },
-    /// We are done setting the entry to the doc
-    AllDone {
-        /// The key of the entry
-        key: Bytes,
-    },
-    /// We got an error and need to abort.
-    ///
-    /// This will be the last message in the stream.
-    Abort(RpcError),
-}
+pub struct DocImportFileResponse(pub ImportProgress);
 
 /// A request to the node to save the data of the entry to the given filepath
 ///
@@ -815,11 +785,11 @@ pub struct DocExportFileRequest {
     pub mode: ExportMode,
 }
 
-impl Msg<ProviderService> for DocExportFileRequest {
+impl Msg<RpcService> for DocExportFileRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for DocExportFileRequest {
+impl ServerStreamingMsg<RpcService> for DocExportFileRequest {
     type Response = DocExportFileResponse;
 }
 
@@ -841,7 +811,7 @@ pub struct DocDelRequest {
     pub prefix: Bytes,
 }
 
-impl RpcMsg<ProviderService> for DocDelRequest {
+impl RpcMsg<RpcService> for DocDelRequest {
     type Response = RpcResult<DocDelResponse>;
 }
 
@@ -867,7 +837,7 @@ pub struct DocSetHashRequest {
     pub size: u64,
 }
 
-impl RpcMsg<ProviderService> for DocSetHashRequest {
+impl RpcMsg<RpcService> for DocSetHashRequest {
     type Response = RpcResult<DocSetHashResponse>;
 }
 
@@ -884,11 +854,11 @@ pub struct DocGetManyRequest {
     pub query: Query,
 }
 
-impl Msg<ProviderService> for DocGetManyRequest {
+impl Msg<RpcService> for DocGetManyRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for DocGetManyRequest {
+impl ServerStreamingMsg<RpcService> for DocGetManyRequest {
     type Response = RpcResult<DocGetManyResponse>;
 }
 
@@ -912,7 +882,7 @@ pub struct DocGetExactRequest {
     pub include_empty: bool,
 }
 
-impl RpcMsg<ProviderService> for DocGetExactRequest {
+impl RpcMsg<RpcService> for DocGetExactRequest {
     type Response = RpcResult<DocGetExactResponse>;
 }
 
@@ -932,7 +902,7 @@ pub struct DocSetDownloadPolicyRequest {
     pub policy: DownloadPolicy,
 }
 
-impl RpcMsg<ProviderService> for DocSetDownloadPolicyRequest {
+impl RpcMsg<RpcService> for DocSetDownloadPolicyRequest {
     type Response = RpcResult<DocSetDownloadPolicyResponse>;
 }
 
@@ -947,7 +917,7 @@ pub struct DocGetDownloadPolicyRequest {
     pub doc_id: NamespaceId,
 }
 
-impl RpcMsg<ProviderService> for DocGetDownloadPolicyRequest {
+impl RpcMsg<RpcService> for DocGetDownloadPolicyRequest {
     type Response = RpcResult<DocGetDownloadPolicyResponse>;
 }
 
@@ -965,7 +935,7 @@ pub struct DocGetSyncPeersRequest {
     pub doc_id: NamespaceId,
 }
 
-impl RpcMsg<ProviderService> for DocGetSyncPeersRequest {
+impl RpcMsg<RpcService> for DocGetSyncPeersRequest {
     type Response = RpcResult<DocGetSyncPeersResponse>;
 }
 
@@ -987,11 +957,11 @@ pub struct BlobReadAtRequest {
     pub len: Option<usize>,
 }
 
-impl Msg<ProviderService> for BlobReadAtRequest {
+impl Msg<RpcService> for BlobReadAtRequest {
     type Pattern = ServerStreaming;
 }
 
-impl ServerStreamingMsg<ProviderService> for BlobReadAtRequest {
+impl ServerStreamingMsg<RpcService> for BlobReadAtRequest {
     type Response = RpcResult<BlobReadAtResponse>;
 }
 
@@ -1028,11 +998,11 @@ pub enum BlobAddStreamUpdate {
     Abort,
 }
 
-impl Msg<ProviderService> for BlobAddStreamRequest {
+impl Msg<RpcService> for BlobAddStreamRequest {
     type Pattern = BidiStreaming;
 }
 
-impl BidiStreamingMsg<ProviderService> for BlobAddStreamRequest {
+impl BidiStreamingMsg<RpcService> for BlobAddStreamRequest {
     type Update = BlobAddStreamUpdate;
     type Response = BlobAddStreamResponse;
 }
@@ -1045,7 +1015,7 @@ pub struct BlobAddStreamResponse(pub AddProgress);
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NodeStatsRequest {}
 
-impl RpcMsg<ProviderService> for NodeStatsRequest {
+impl RpcMsg<RpcService> for NodeStatsRequest {
     type Response = RpcResult<NodeStatsResponse>;
 }
 
@@ -1067,13 +1037,16 @@ pub struct NodeStatsResponse {
 
 /// The RPC service for the iroh provider process.
 #[derive(Debug, Clone)]
-pub struct ProviderService;
+pub struct RpcService;
 
 /// The request enum, listing all possible requests.
 #[allow(missing_docs)]
 #[derive(strum::Display, Debug, Serialize, Deserialize, From, TryInto)]
-pub enum ProviderRequest {
+pub enum Request {
     NodeStatus(NodeStatusRequest),
+    NodeId(NodeIdRequest),
+    NodeAddr(NodeAddrRequest),
+    NodeRelay(NodeRelayRequest),
     NodeStats(NodeStatsRequest),
     NodeShutdown(NodeShutdownRequest),
     NodeConnections(NodeConnectionsRequest),
@@ -1088,12 +1061,10 @@ pub enum ProviderRequest {
     BlobExport(BlobExportRequest),
     BlobList(BlobListRequest),
     BlobListIncomplete(BlobListIncompleteRequest),
-    BlobListCollections(BlobListCollectionsRequest),
     BlobDeleteBlob(BlobDeleteBlobRequest),
     BlobValidate(BlobValidateRequest),
     BlobFsck(BlobConsistencyCheckRequest),
     CreateCollection(CreateCollectionRequest),
-    BlobGetCollection(BlobGetCollectionRequest),
 
     DeleteTag(DeleteTagRequest),
     ListTags(ListTagsRequest),
@@ -1122,14 +1093,21 @@ pub enum ProviderRequest {
 
     AuthorList(AuthorListRequest),
     AuthorCreate(AuthorCreateRequest),
+    AuthorGetDefault(AuthorGetDefaultRequest),
+    AuthorSetDefault(AuthorSetDefaultRequest),
     AuthorImport(AuthorImportRequest),
+    AuthorExport(AuthorExportRequest),
+    AuthorDelete(AuthorDeleteRequest),
 }
 
 /// The response enum, listing all possible responses.
 #[allow(missing_docs, clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize, From, TryInto)]
-pub enum ProviderResponse {
-    NodeStatus(RpcResult<NodeStatusResponse>),
+pub enum Response {
+    NodeStatus(RpcResult<NodeStatus>),
+    NodeId(RpcResult<NodeId>),
+    NodeAddr(RpcResult<NodeAddr>),
+    NodeRelay(RpcResult<Option<RelayUrl>>),
     NodeStats(RpcResult<NodeStatsResponse>),
     NodeConnections(RpcResult<NodeConnectionsResponse>),
     NodeConnectionInfo(RpcResult<NodeConnectionInfoResponse>),
@@ -1139,17 +1117,15 @@ pub enum ProviderResponse {
     BlobReadAt(RpcResult<BlobReadAtResponse>),
     BlobAddStream(BlobAddStreamResponse),
     BlobAddPath(BlobAddPathResponse),
-    BlobList(RpcResult<BlobListResponse>),
-    BlobListIncomplete(RpcResult<BlobListIncompleteResponse>),
-    BlobListCollections(RpcResult<BlobListCollectionsResponse>),
+    BlobList(RpcResult<BlobInfo>),
+    BlobListIncomplete(RpcResult<IncompleteBlobInfo>),
     BlobDownload(BlobDownloadResponse),
     BlobFsck(ConsistencyCheckProgress),
     BlobExport(BlobExportResponse),
     BlobValidate(ValidateProgress),
     CreateCollection(RpcResult<CreateCollectionResponse>),
-    BlobGetCollection(RpcResult<BlobGetCollectionResponse>),
 
-    ListTags(ListTagsResponse),
+    ListTags(TagInfo),
     DeleteTag(RpcResult<()>),
 
     DocOpen(RpcResult<DocOpenResponse>),
@@ -1173,13 +1149,18 @@ pub enum ProviderResponse {
     DocGetDownloadPolicy(RpcResult<DocGetDownloadPolicyResponse>),
     DocSetDownloadPolicy(RpcResult<DocSetDownloadPolicyResponse>),
     DocGetSyncPeers(RpcResult<DocGetSyncPeersResponse>),
+    StreamCreated(RpcResult<StreamCreated>),
 
     AuthorList(RpcResult<AuthorListResponse>),
     AuthorCreate(RpcResult<AuthorCreateResponse>),
+    AuthorGetDefault(RpcResult<AuthorGetDefaultResponse>),
+    AuthorSetDefault(RpcResult<AuthorSetDefaultResponse>),
     AuthorImport(RpcResult<AuthorImportResponse>),
+    AuthorExport(RpcResult<AuthorExportResponse>),
+    AuthorDelete(RpcResult<AuthorDeleteResponse>),
 }
 
-impl Service for ProviderService {
-    type Req = ProviderRequest;
-    type Res = ProviderResponse;
+impl Service for RpcService {
+    type Req = Request;
+    type Res = Response;
 }

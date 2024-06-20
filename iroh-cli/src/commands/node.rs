@@ -5,12 +5,13 @@ use clap::Subcommand;
 use colored::Colorize;
 use comfy_table::Table;
 use comfy_table::{presets::NOTHING, Cell};
-use futures::{Stream, StreamExt};
+use futures_lite::{Stream, StreamExt};
 use human_time::ToHumanTimeString;
 use iroh::client::Iroh;
-use iroh::net::{key::PublicKey, magic_endpoint::ConnectionInfo, magicsock::DirectAddrInfo};
-use iroh::rpc_protocol::ProviderService;
-use quic_rpc::ServiceConnection;
+use iroh::net::{
+    endpoint::{ConnectionInfo, DirectAddrInfo},
+    key::PublicKey,
+};
 
 #[derive(Subcommand, Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -35,13 +36,10 @@ pub enum NodeCommands {
 }
 
 impl NodeCommands {
-    pub async fn run<C>(self, iroh: &Iroh<C>) -> Result<()>
-    where
-        C: ServiceConnection<ProviderService>,
-    {
+    pub async fn run(self, iroh: &Iroh) -> Result<()> {
         match self {
             Self::Connections => {
-                let connections = iroh.node.connections().await?;
+                let connections = iroh.connections().await?;
                 let timestamp = time::OffsetDateTime::now_utc()
                     .format(&time::format_description::well_known::Rfc2822)
                     .unwrap_or_else(|_| String::from("failed to get current time"));
@@ -54,17 +52,17 @@ impl NodeCommands {
                 );
             }
             Self::Connection { node_id } => {
-                let conn_info = iroh.node.connection_info(node_id).await?;
+                let conn_info = iroh.connection_info(node_id).await?;
                 match conn_info {
                     Some(info) => println!("{}", fmt_connection(info)),
                     None => println!("Not Found"),
                 }
             }
             Self::Shutdown { force } => {
-                iroh.node.shutdown(force).await?;
+                iroh.shutdown(force).await?;
             }
             Self::Stats => {
-                let stats = iroh.node.stats().await?;
+                let stats = iroh.stats().await?;
                 for (name, details) in stats.iter() {
                     println!(
                         "{:23} : {:>6}    ({})",
@@ -73,7 +71,7 @@ impl NodeCommands {
                 }
             }
             Self::Status => {
-                let response = iroh.node.status().await?;
+                let response = iroh.status().await?;
                 println!("Listening addresses: {:#?}", response.listen_addrs);
                 println!("Node public key: {}", response.addr.node_id);
                 println!("Version: {}", response.version);
@@ -96,7 +94,7 @@ async fn fmt_connections(
         let node_id: Cell = conn_info.node_id.to_string().into();
         let relay_url = conn_info
             .relay_url
-            .map_or(String::new(), |url| url.to_string())
+            .map_or(String::new(), |url_info| url_info.relay_url.to_string())
             .into();
         let conn_type = conn_info.conn_type.to_string().into();
         let latency = match conn_info.latency {
@@ -132,7 +130,7 @@ fn fmt_connection(info: ConnectionInfo) -> String {
     table.add_row([bold_cell("current time"), timestamp.into()]);
     table.add_row([bold_cell("node id"), node_id.to_string().into()]);
     let relay_url = relay_url
-        .map(|r| r.to_string())
+        .map(|r| r.relay_url.to_string())
         .unwrap_or_else(|| String::from("unknown"));
     table.add_row([bold_cell("relay url"), relay_url.into()]);
     table.add_row([bold_cell("connection type"), conn_type.to_string().into()]);

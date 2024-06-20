@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use futures::StreamExt;
+use futures_lite::StreamExt;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info_span, trace, Instrument};
 
@@ -210,7 +210,7 @@ impl Client {
 struct Probe {
     /// When was the probe last updated.
     last_probe: Instant,
-    /// The last [`igd::aio::Gateway`] and when was it last seen.
+    /// The last [`upnp::Gateway`] and when was it last seen.
     last_upnp_gateway_addr: Option<(upnp::Gateway, Instant)>,
     /// Last time PCP was seen.
     last_pcp: Option<Instant>,

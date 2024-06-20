@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
+    future::Future,
     net::{IpAddr, SocketAddr},
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
@@ -8,7 +9,6 @@ use std::{
 use anyhow::Context;
 use backoff::backoff::Backoff;
 use bytes::{Bytes, BytesMut};
-use futures::Future;
 use iroh_metrics::{inc, inc_by};
 use tokio::{
     sync::{mpsc, oneshot},
@@ -23,7 +23,7 @@ use crate::{
     relay::{self, http::ClientError, ReceivedMessage, RelayUrl, MAX_PACKET_SIZE},
 };
 
-use super::{ActorMessage, Inner};
+use super::{ActorMessage, MagicSock};
 use super::{Metrics as MagicsockMetrics, RelayContents};
 
 /// How long a non-home relay connection needs to be idle (last written to) before we close it.
@@ -38,12 +38,10 @@ pub(super) enum RelayActorMessage {
         contents: RelayContents,
         peer: PublicKey,
     },
-    Connect {
-        url: RelayUrl,
-        peer: Option<PublicKey>,
-    },
-    NotePreferred(RelayUrl),
     MaybeCloseRelaysOnRebind(Vec<IpAddr>),
+    SetHome {
+        url: RelayUrl,
+    },
 }
 
 /// Contains fields for an active relay connection.
@@ -107,6 +105,7 @@ impl ActiveRelay {
     }
 
     async fn run(mut self, mut inbox: mpsc::Receiver<ActiveRelayMessage>) -> anyhow::Result<()> {
+        debug!("initial dial {}", self.url);
         self.relay_client
             .connect()
             .await
@@ -276,7 +275,7 @@ impl ActiveRelay {
 }
 
 pub(super) struct RelayActor {
-    conn: Arc<Inner>,
+    msock: Arc<MagicSock>,
     /// relay Url -> connection to the node
     active_relay: BTreeMap<RelayUrl, (mpsc::Sender<ActiveRelayMessage>, JoinHandle<()>)>,
     msg_sender: mpsc::Sender<ActorMessage>,
@@ -285,10 +284,10 @@ pub(super) struct RelayActor {
 }
 
 impl RelayActor {
-    pub(super) fn new(conn: Arc<Inner>, msg_sender: mpsc::Sender<ActorMessage>) -> Self {
+    pub(super) fn new(msock: Arc<MagicSock>, msg_sender: mpsc::Sender<ActorMessage>) -> Self {
         let cancel_token = CancellationToken::new();
         Self {
-            conn,
+            msock,
             active_relay: Default::default(),
             msg_sender,
             ping_tasks: Default::default(),
@@ -349,11 +348,9 @@ impl RelayActor {
             } => {
                 self.send_relay(&url, contents, peer).await;
             }
-            RelayActorMessage::Connect { url, peer } => {
-                self.connect_relay(&url, peer.as_ref()).await;
-            }
-            RelayActorMessage::NotePreferred(my_relay) => {
-                self.note_preferred(&my_relay).await;
+            RelayActorMessage::SetHome { url } => {
+                self.note_preferred(&url).await;
+                self.connect_relay(&url, None).await;
             }
             RelayActorMessage::MaybeCloseRelaysOnRebind(ifs) => {
                 self.maybe_close_relays_on_rebind(&ifs).await;
@@ -362,7 +359,7 @@ impl RelayActor {
     }
 
     async fn note_preferred(&self, my_url: &RelayUrl) {
-        futures::future::join_all(self.active_relay.iter().map(|(url, (s, _))| async move {
+        futures_buffered::join_all(self.active_relay.iter().map(|(url, (s, _))| async move {
             let is_preferred = url == my_url;
             s.send(ActiveRelayMessage::NotePreferred(is_preferred))
                 .await
@@ -399,7 +396,7 @@ impl RelayActor {
         }
 
         // Wake up the send waker if one is waiting for space in the channel
-        let mut wakers = self.conn.network_send_wakers.lock();
+        let mut wakers = self.msock.network_send_wakers.lock();
         if let Some(waker) = wakers.take() {
             waker.wake();
         }
@@ -407,7 +404,8 @@ impl RelayActor {
 
     /// Returns `true`if the message was sent successfully.
     async fn send_to_active(&mut self, url: &RelayUrl, msg: ActiveRelayMessage) -> bool {
-        match self.active_relay.get(url) {
+        let res = self.active_relay.get(url);
+        match res {
             Some((s, _)) => match s.send(msg).await {
                 Ok(_) => true,
                 Err(mpsc::error::SendError(_)) => {
@@ -425,6 +423,7 @@ impl RelayActor {
         url: &RelayUrl,
         peer: Option<&PublicKey>,
     ) -> relay::http::Client {
+        debug!("connect relay {} for peer {:?}", url, peer);
         // See if we have a connection open to that relay node ID first. If so, might as
         // well use it. (It's a little arbitrary whether we use this one vs. the reverse route
         // below when we have both.)
@@ -472,22 +471,33 @@ impl RelayActor {
         } else {
             "home-keep-alive".to_string()
         };
-        info!("adding connection to relay-{url} for {why}");
+        info!("adding connection to relay: {url} for {why}");
 
-        let my_relay = self.conn.my_relay();
-        let ipv6_reported = self.conn.ipv6_reported.clone();
+        let my_relay = self.msock.my_relay();
+        let ipv6_reported = self.msock.ipv6_reported.clone();
         let url = url.clone();
         let url1 = url.clone();
 
-        // building a client does not dial
-        let (dc, dc_receiver) = relay::http::ClientBuilder::new(url1.clone())
+        // building a client dials the relay
+        let mut builder = relay::http::ClientBuilder::new(url1.clone());
+        if let Some(url) = self.msock.proxy_url() {
+            builder = builder.proxy_url(url.clone());
+        }
+        let builder = builder
             .address_family_selector(move || {
                 let ipv6_reported = ipv6_reported.clone();
                 Box::pin(async move { ipv6_reported.load(Ordering::Relaxed) })
             })
             .can_ack_pings(true)
-            .is_preferred(my_relay.as_ref() == Some(&url1))
-            .build(self.conn.secret_key.clone(), self.conn.dns_resolver.clone());
+            .is_preferred(my_relay.as_ref() == Some(&url1));
+
+        #[cfg(any(test, feature = "test-utils"))]
+        let builder = builder.insecure_skip_cert_verify(self.msock.insecure_skip_relay_cert_verify);
+
+        let (dc, dc_receiver) = builder.build(
+            self.msock.secret_key.clone(),
+            self.msock.dns_resolver.clone(),
+        );
 
         let (s, r) = mpsc::channel(64);
 
@@ -582,7 +592,7 @@ impl RelayActor {
     /// our current home relay.
     async fn close_or_reconnect_relay(&mut self, url: &RelayUrl, why: &'static str) {
         self.close_relay(url, why).await;
-        if self.conn.my_relay().as_ref() == Some(url) {
+        if self.msock.my_relay().as_ref() == Some(url) {
             self.connect_relay(url, None).await;
         }
     }
@@ -593,7 +603,7 @@ impl RelayActor {
 
         let mut to_close = Vec::new();
         for (i, (s, _)) in &self.active_relay {
-            if Some(i) == self.conn.my_relay().as_ref() {
+            if Some(i) == self.msock.my_relay().as_ref() {
                 continue;
             }
             let (os, or) = oneshot::channel();

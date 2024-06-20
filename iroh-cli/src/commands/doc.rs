@@ -10,22 +10,23 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use colored::Colorize;
 use dialoguer::Confirm;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures_buffered::BufferedStreamExt;
+use futures_lite::{Stream, StreamExt};
 use indicatif::{HumanBytes, HumanDuration, MultiProgress, ProgressBar, ProgressStyle};
-use iroh::base::base32::fmt_short;
-use quic_rpc::ServiceConnection;
-use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
-use iroh::bytes::{provider::AddProgress, Hash, Tag};
-use iroh::sync::{
-    store::{DownloadPolicy, FilterKind, Query, SortDirection},
-    AuthorId, NamespaceId,
-};
 use iroh::{
-    client::{Doc, Entry, Iroh, LiveEvent},
-    rpc_protocol::{DocTicket, ProviderService, SetTagOption, WrapOption},
-    sync_engine::Origin,
+    base::{base32::fmt_short, node_addr::AddrInfoOptions},
+    blobs::{provider::AddProgress, util::SetTagOption, Hash, Tag},
+    client::{
+        blobs::WrapOption,
+        docs::{Doc, Entry, LiveEvent, Origin, ShareMode},
+        Iroh,
+    },
+    docs::{
+        store::{DownloadPolicy, FilterKind, Query, SortDirection},
+        AuthorId, DocTicket, NamespaceId,
+    },
     util::fs::{path_content_info, path_to_key, PathContent},
 };
 
@@ -111,7 +112,13 @@ pub enum DocCommands {
         /// Within the Iroh console, the active document can also set with `doc switch`.
         #[clap(short, long)]
         doc: Option<NamespaceId>,
+        /// The sharing mode.
         mode: ShareMode,
+        /// Options to configure the address information in the generated ticket.
+        ///
+        /// Use `relay-and-addresses` in networks with no internet connectivity.
+        #[clap(long, default_value_t = AddrInfoOptions::Id)]
+        addr_options: AddrInfoOptions,
     },
     /// Set an entry in a document.
     Set {
@@ -276,24 +283,6 @@ pub enum DocCommands {
     },
 }
 
-/// Intended capability for document share tickets
-#[derive(Serialize, Deserialize, Debug, Clone, clap::ValueEnum)]
-pub enum ShareMode {
-    /// Read-only access
-    Read,
-    /// Write access
-    Write,
-}
-
-impl From<ShareMode> for iroh::rpc_protocol::ShareMode {
-    fn from(value: ShareMode) -> Self {
-        match value {
-            ShareMode::Read => iroh::rpc_protocol::ShareMode::Read,
-            ShareMode::Write => iroh::rpc_protocol::ShareMode::Write,
-        }
-    }
-}
-
 #[derive(clap::ValueEnum, Clone, Debug, Default, strum::Display)]
 #[strum(serialize_all = "kebab-case")]
 pub enum Sorting {
@@ -303,7 +292,7 @@ pub enum Sorting {
     /// Sort by key, then author
     Key,
 }
-impl From<Sorting> for iroh::sync::store::SortBy {
+impl From<Sorting> for iroh::docs::store::SortBy {
     fn from(value: Sorting) -> Self {
         match value {
             Sorting::Author => Self::AuthorKey,
@@ -313,10 +302,7 @@ impl From<Sorting> for iroh::sync::store::SortBy {
 }
 
 impl DocCommands {
-    pub async fn run<C>(self, iroh: &Iroh<C>, env: &ConsoleEnv) -> Result<()>
-    where
-        C: ServiceConnection<ProviderService>,
-    {
+    pub async fn run(self, iroh: &Iroh, env: &ConsoleEnv) -> Result<()> {
         match self {
             Self::Switch { id: doc } => {
                 env.set_doc(doc)?;
@@ -327,7 +313,7 @@ impl DocCommands {
                     bail!("The --switch flag is only supported within the Iroh console.");
                 }
 
-                let doc = iroh.docs.create().await?;
+                let doc = iroh.docs().create().await?;
                 println!("{}", doc.id());
 
                 if switch {
@@ -340,7 +326,7 @@ impl DocCommands {
                     bail!("The --switch flag is only supported within the Iroh console.");
                 }
 
-                let doc = iroh.docs.import(ticket).await?;
+                let doc = iroh.docs().import(ticket).await?;
                 println!("{}", doc.id());
 
                 if switch {
@@ -349,14 +335,18 @@ impl DocCommands {
                 }
             }
             Self::List => {
-                let mut stream = iroh.docs.list().await?;
+                let mut stream = iroh.docs().list().await?;
                 while let Some((id, kind)) = stream.try_next().await? {
                     println!("{id} {kind}")
                 }
             }
-            Self::Share { doc, mode } => {
+            Self::Share {
+                doc,
+                mode,
+                addr_options,
+            } => {
                 let doc = get_doc(iroh, env, doc).await?;
-                let ticket = doc.share(mode.into()).await?;
+                let ticket = doc.share(mode, addr_options).await?;
                 println!("{}", ticket);
             }
             Self::Set {
@@ -366,7 +356,7 @@ impl DocCommands {
                 value,
             } => {
                 let doc = get_doc(iroh, env, doc).await?;
-                let author = env.author(author)?;
+                let author = author.unwrap_or(env.author());
                 let key = key.as_bytes().to_vec();
                 let value = value.as_bytes().to_vec();
                 let hash = doc.set_bytes(author, key, value).await?;
@@ -378,7 +368,7 @@ impl DocCommands {
                 prefix,
             } => {
                 let doc = get_doc(iroh, env, doc).await?;
-                let author = env.author(author)?;
+                let author = author.unwrap_or(env.author());
                 let prompt =
                     format!("Deleting all entries whose key starts with {prefix}. Continue?");
                 if Confirm::new()
@@ -459,7 +449,7 @@ impl DocCommands {
                 no_prompt,
             } => {
                 let doc = get_doc(iroh, env, doc).await?;
-                let author = env.author(author)?;
+                let author = author.unwrap_or(env.author());
                 let mut prefix = prefix.unwrap_or_else(|| String::from(""));
 
                 if prefix.ends_with('/') {
@@ -489,7 +479,7 @@ impl DocCommands {
                 }
 
                 let stream = iroh
-                    .blobs
+                    .blobs()
                     .add_from_path(
                         root.clone(),
                         in_place,
@@ -564,16 +554,16 @@ impl DocCommands {
                             content_status,
                         } => {
                             let content = match content_status {
-                                iroh::sync::ContentStatus::Complete => {
+                                iroh::docs::ContentStatus::Complete => {
                                     fmt_entry(&doc, &entry, DisplayContentMode::Auto).await
                                 }
-                                iroh::sync::ContentStatus::Incomplete => {
+                                iroh::docs::ContentStatus::Incomplete => {
                                     let (Ok(content) | Err(content)) =
                                         fmt_content(&doc, &entry, DisplayContentMode::ShortHash)
                                             .await;
                                     format!("<incomplete: {} ({})>", content, human_len(&entry))
                                 }
-                                iroh::sync::ContentStatus::Missing => {
+                                iroh::docs::ContentStatus::Missing => {
                                     let (Ok(content) | Err(content)) =
                                         fmt_content(&doc, &entry, DisplayContentMode::ShortHash)
                                             .await;
@@ -595,8 +585,13 @@ impl DocCommands {
                                 Origin::Connect(_) => "we initiated",
                             };
                             match event.result {
-                                Ok(()) => {
-                                    println!("synced peer {} ({origin})", fmt_short(event.peer))
+                                Ok(details) => {
+                                    println!(
+                                        "synced peer {} ({origin}, received {}, sent {}",
+                                        fmt_short(event.peer),
+                                        details.entries_received,
+                                        details.entries_sent
+                                    )
                                 }
                                 Err(err) => println!(
                                     "failed to sync with peer {} ({origin}): {err}",
@@ -609,6 +604,9 @@ impl DocCommands {
                         }
                         LiveEvent::NeighborDown(peer) => {
                             println!("neighbor peer down: {peer:?}");
+                        }
+                        LiveEvent::PendingContentReady => {
+                            println!("all pending content is now ready")
                         }
                     }
                 }
@@ -625,7 +623,7 @@ impl DocCommands {
                     .interact()
                     .unwrap_or(false)
                 {
-                    iroh.docs.drop_doc(doc.id()).await?;
+                    iroh.docs().drop_doc(doc.id()).await?;
                     println!("Doc {} has been deleted.", fmt_short(doc.id()));
                 } else {
                     println!("Aborted.")
@@ -671,29 +669,15 @@ impl DocCommands {
     }
 }
 
-async fn get_doc<C>(
-    iroh: &Iroh<C>,
-    env: &ConsoleEnv,
-    id: Option<NamespaceId>,
-) -> anyhow::Result<Doc<C>>
-where
-    C: ServiceConnection<ProviderService>,
-{
-    iroh.docs
+async fn get_doc(iroh: &Iroh, env: &ConsoleEnv, id: Option<NamespaceId>) -> anyhow::Result<Doc> {
+    iroh.docs()
         .open(env.doc(id)?)
         .await?
         .context("Document not found")
 }
 
 /// Format the content. If an error occurs it's returned in a formatted, friendly way.
-async fn fmt_content<C>(
-    doc: &Doc<C>,
-    entry: &Entry,
-    mode: DisplayContentMode,
-) -> Result<String, String>
-where
-    C: ServiceConnection<ProviderService>,
-{
+async fn fmt_content(doc: &Doc, entry: &Entry, mode: DisplayContentMode) -> Result<String, String> {
     let read_failed = |err: anyhow::Error| format!("<failed to get content: {err}>");
     let encode_hex = |err: std::string::FromUtf8Error| format!("0x{}", hex::encode(err.as_bytes()));
     let as_utf8 = |buf: Vec<u8>| String::from_utf8(buf).map(|repr| format!("\"{repr}\""));
@@ -741,10 +725,7 @@ fn human_len(entry: &Entry) -> HumanBytes {
 }
 
 #[must_use = "this won't be printed, you need to print it yourself"]
-async fn fmt_entry<C>(doc: &Doc<C>, entry: &Entry, mode: DisplayContentMode) -> String
-where
-    C: ServiceConnection<ProviderService>,
-{
+async fn fmt_entry(doc: &Doc, entry: &Entry, mode: DisplayContentMode) -> String {
     let key = std::str::from_utf8(entry.key())
         .unwrap_or("<bad key>")
         .bold();
@@ -774,18 +755,15 @@ fn tag_from_file_name(path: &Path) -> anyhow::Result<Tag> {
 /// document via the hash of the blob.
 /// It also creates and powers the `ImportProgressBar`.
 #[tracing::instrument(skip_all)]
-async fn import_coordinator<C>(
-    doc: Doc<C>,
+async fn import_coordinator(
+    doc: Doc,
     author_id: AuthorId,
     root: PathBuf,
     prefix: String,
     blob_add_progress: impl Stream<Item = Result<AddProgress>> + Send + Unpin + 'static,
     expected_size: u64,
     expected_entries: u64,
-) -> Result<()>
-where
-    C: ServiceConnection<ProviderService>,
-{
+) -> Result<()> {
     let imp = ImportProgressBar::new(
         &root.display().to_string(),
         doc.id(),
@@ -799,8 +777,11 @@ where
         (String, u64, Option<Hash>, u64),
     >::new()));
 
-    let _stats: Vec<u64> = blob_add_progress
-        .filter_map(|item| async {
+    let doc2 = doc.clone();
+    let imp2 = task_imp.clone();
+
+    let _stats: Vec<_> = blob_add_progress
+        .filter_map(|item| {
             let item = match item.context("Error adding files") {
                 Err(e) => return Some(Err(e)),
                 Ok(item) => item,
@@ -871,20 +852,22 @@ where
                 }
             }
         })
-        .try_chunks(1024)
-        .map_ok(|chunks| {
-            futures::stream::iter(chunks.into_iter().map(|(key, hash, size)| {
-                let doc = doc.clone();
-                let imp = task_imp.clone();
-                Ok(async move {
-                    doc.set_hash(author_id, key, hash, size).await?;
-                    imp.import_progress();
-                    anyhow::Ok(size)
-                })
-            }))
+        .map(move |res| {
+            let doc = doc2.clone();
+            let imp = imp2.clone();
+            async move {
+                match res {
+                    Ok((key, hash, size)) => {
+                        let doc = doc.clone();
+                        doc.set_hash(author_id, key, hash, size).await?;
+                        imp.import_progress();
+                        Ok(size)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
         })
-        .try_flatten()
-        .try_buffer_unordered(64)
+        .buffered_unordered(128)
         .try_collect()
         .await?;
 
@@ -968,12 +951,14 @@ mod tests {
 
         let node = crate::commands::start::start_node(data_dir.path(), None).await?;
         let client = node.client();
-        let doc = client.docs.create().await.context("doc create")?;
-        let author = client.authors.create().await.context("author create")?;
+        let doc = client.docs().create().await.context("doc create")?;
+        let author = client.authors().create().await.context("author create")?;
 
         // set up command, getting iroh node
-        let cli = ConsoleEnv::for_console(data_dir.path()).context("ConsoleEnv")?;
-        let iroh = iroh::client::quic::Iroh::connect(data_dir.path())
+        let cli = ConsoleEnv::for_console(data_dir.path().to_owned(), &node)
+            .await
+            .context("ConsoleEnv")?;
+        let iroh = iroh::client::Iroh::connect(data_dir.path())
             .await
             .context("rpc connect")?;
 
@@ -996,7 +981,7 @@ mod tests {
             .await?;
         assert_eq!(2, keys.len());
 
-        iroh.node.shutdown(false).await?;
+        iroh.shutdown(false).await?;
         Ok(())
     }
 }

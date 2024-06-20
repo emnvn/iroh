@@ -2,27 +2,27 @@
 
 use std::{collections::HashMap, pin::Pin, task::Poll};
 
-use crate::{key::PublicKey, MagicEndpoint, NodeAddr, NodeId};
+use crate::{key::PublicKey, Endpoint, NodeAddr, NodeId};
 use anyhow::anyhow;
-use futures::future::BoxFuture;
+use futures_lite::future::Boxed as BoxFuture;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 /// Dial nodes and maintain a queue of pending dials
 ///
-/// This wraps a [`MagicEndpoint`], connects to nodes through the endpoint, stores
+/// This wraps a [`Endpoint`], connects to nodes through the endpoint, stores
 /// the pending connect futures and emits finished connect results.
 #[derive(Debug)]
 pub struct Dialer {
-    endpoint: MagicEndpoint,
+    endpoint: Endpoint,
     pending: JoinSet<(PublicKey, anyhow::Result<quinn::Connection>)>,
     pending_dials: HashMap<PublicKey, CancellationToken>,
 }
 
 impl Dialer {
-    /// Create a new dialer for a [`MagicEndpoint`]
-    pub fn new(endpoint: MagicEndpoint) -> Self {
+    /// Create a new dialer for a [`Endpoint`]
+    pub fn new(endpoint: Endpoint) -> Self {
         Self {
             endpoint,
             pending: Default::default(),
@@ -33,7 +33,7 @@ impl Dialer {
     /// Start to dial a node.
     ///
     /// Note that the node's addresses and/or relay url must be added to the endpoint's
-    /// addressbook for a dial to succeed, see [`MagicEndpoint::add_node_addr`].
+    /// addressbook for a dial to succeed, see [`Endpoint::add_node_addr`].
     pub fn queue_dial(&mut self, node_id: NodeId, alpn: &'static [u8]) {
         if self.is_pending(&node_id) {
             return;
@@ -78,14 +78,14 @@ impl Dialer {
                         }
                         None => {
                             error!("no more pending conns available");
-                            futures::future::pending().await
+                            std::future::pending().await
                         }
                     }
                 };
 
                 (node_id, res)
             }
-            true => futures::future::pending().await,
+            true => std::future::pending().await,
         }
     }
 
@@ -95,7 +95,7 @@ impl Dialer {
     }
 }
 
-impl futures::Stream for Dialer {
+impl futures_lite::Stream for Dialer {
     type Item = (PublicKey, anyhow::Result<quinn::Connection>);
 
     fn poll_next(
@@ -117,4 +117,4 @@ impl futures::Stream for Dialer {
 }
 
 /// Future for a pending dial operation
-pub type DialFuture = BoxFuture<'static, (PublicKey, anyhow::Result<quinn::Connection>)>;
+pub type DialFuture = BoxFuture<(PublicKey, anyhow::Result<quinn::Connection>)>;

@@ -23,10 +23,13 @@ async fn main() -> anyhow::Result<()> {
     let node = iroh::node::Node::memory().spawn().await?;
 
     // add some data and remember the hash
-    let res = node.blobs.add_bytes("Hello, world!").await?;
+    let res = node.blobs().add_bytes("Hello, world!").await?;
 
     // create a ticket
-    let ticket = node.ticket(res.hash, res.format).await?;
+    let ticket = node
+        .blobs()
+        .share(res.hash, res.format, Default::default())
+        .await?;
 
     // print some info about the node
     println!("serving hash:    {}", ticket.hash());
@@ -48,6 +51,6 @@ async fn main() -> anyhow::Result<()> {
     println!("\t cargo run --example hello-world-fetch {}", ticket);
     // wait for the node to finish, this will block indefinitely
     // stop with SIGINT (ctrl+c)
-    node.await?;
+    node.shutdown().await?;
     Ok(())
 }

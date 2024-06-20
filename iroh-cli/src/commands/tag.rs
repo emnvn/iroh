@@ -1,10 +1,9 @@
 use anyhow::Result;
 use bytes::Bytes;
 use clap::Subcommand;
-use futures::StreamExt;
-use iroh::bytes::Tag;
-use iroh::{client::Iroh, rpc_protocol::ProviderService};
-use quic_rpc::ServiceConnection;
+use futures_lite::StreamExt;
+use iroh::blobs::Tag;
+use iroh::client::Iroh;
 
 #[derive(Subcommand, Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -20,16 +19,13 @@ pub enum TagCommands {
 }
 
 impl TagCommands {
-    pub async fn run<C>(self, iroh: &Iroh<C>) -> Result<()>
-    where
-        C: ServiceConnection<ProviderService>,
-    {
+    pub async fn run(self, iroh: &Iroh) -> Result<()> {
         match self {
             Self::List => {
-                let mut response = iroh.tags.list().await?;
+                let mut response = iroh.tags().list().await?;
                 while let Some(res) = response.next().await {
                     let res = res?;
-                    println!("{}: {} ({:?})", res.name, res.hash, res.format,);
+                    println!("{}: {} ({:?})", res.name, res.hash, res.format);
                 }
             }
             Self::Delete { tag, hex } => {
@@ -38,7 +34,7 @@ impl TagCommands {
                 } else {
                     Tag::from(tag)
                 };
-                iroh.tags.delete(tag).await?;
+                iroh.tags().delete(tag).await?;
             }
         }
         Ok(())

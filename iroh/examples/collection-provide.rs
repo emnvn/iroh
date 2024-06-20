@@ -6,8 +6,7 @@
 //! This is using an in memory database and a random node id.
 //! run this example from the project root:
 //!     $ cargo run --example collection-provide
-use iroh::rpc_protocol::SetTagOption;
-use iroh_bytes::{format::collection::Collection, BlobFormat};
+use iroh::blobs::{format::collection::Collection, util::SetTagOption, BlobFormat};
 use tracing_subscriber::{prelude::*, EnvFilter};
 
 // set the RUST_LOG env var to one of {debug,info,warn} to see logging info
@@ -28,8 +27,8 @@ async fn main() -> anyhow::Result<()> {
     let node = iroh::node::Node::memory().spawn().await?;
 
     // Add two blobs
-    let blob1 = node.blobs.add_bytes("the first blob of bytes").await?;
-    let blob2 = node.blobs.add_bytes("the second blob of bytes").await?;
+    let blob1 = node.blobs().add_bytes("the first blob of bytes").await?;
+    let blob2 = node.blobs().add_bytes("the second blob of bytes").await?;
 
     // Create blobs from the data
     let collection: Collection = [("blob1", blob1.hash), ("blob2", blob2.hash)]
@@ -38,13 +37,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Create a collection
     let (hash, _) = node
-        .blobs
+        .blobs()
         .create_collection(collection, SetTagOption::Auto, Default::default())
         .await?;
 
     // create a ticket
     // tickets wrap all details needed to get a collection
-    let ticket = node.ticket(hash, BlobFormat::HashSeq).await?;
+    let ticket = node
+        .blobs()
+        .share(hash, BlobFormat::HashSeq, Default::default())
+        .await?;
 
     // print some info about the node
     println!("serving hash:    {}", ticket.hash());
@@ -66,6 +68,6 @@ async fn main() -> anyhow::Result<()> {
     println!("\tcargo run --example collection-fetch {}", ticket);
     // wait for the node to finish, this will block indefinitely
     // stop with SIGINT (ctrl+c)
-    node.await?;
+    node.shutdown().await?;
     Ok(())
 }

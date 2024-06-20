@@ -1,83 +1,49 @@
 //! Configuration for the iroh CLI.
 
 use std::{
-    collections::HashMap,
-    env, fmt,
+    env,
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
 };
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
-use config::{Environment, File, Value};
+use anyhow::{anyhow, bail, Context, Result};
 use iroh::net::{
     defaults::{default_eu_relay_node, default_na_relay_node},
     relay::{RelayMap, RelayNode},
 };
 use iroh::node::GcPolicy;
-use iroh::sync::{AuthorId, NamespaceId};
+use iroh::{
+    client::Iroh,
+    docs::{AuthorId, NamespaceId},
+};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::warn;
+
+const ENV_AUTHOR: &str = "IROH_AUTHOR";
+const ENV_DOC: &str = "IROH_DOC";
+const ENV_CONFIG_DIR: &str = "IROH_CONFIG_DIR";
+const ENV_FILE_RUST_LOG: &str = "IROH_FILE_RUST_LOG";
 
 /// CONFIG_FILE_NAME is the name of the optional config file located in the iroh home directory
 pub(crate) const CONFIG_FILE_NAME: &str = "iroh.config.toml";
 
-/// ENV_PREFIX should be used along side the config field name to set a config field using
-/// environment variables
-/// For example, `IROH_PATH=/path/to/config` would set the value of the `Config.path` field
-pub(crate) const ENV_PREFIX: &str = "IROH";
-
-const ENV_AUTHOR: &str = "AUTHOR";
-const ENV_DOC: &str = "DOC";
-
-/// Fetches the environment variable `IROH_<key>` from the current process.
-pub(crate) fn env_var(key: &str) -> std::result::Result<String, env::VarError> {
-    env::var(format!("{ENV_PREFIX}_{key}"))
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, strum::AsRefStr, strum::EnumString, strum::Display)]
 pub(crate) enum ConsolePaths {
-    DefaultAuthor,
+    #[strum(serialize = "current-author")]
+    CurrentAuthor,
+    #[strum(serialize = "history")]
     History,
 }
 
-impl From<&ConsolePaths> for &'static str {
-    fn from(value: &ConsolePaths) -> Self {
-        match value {
-            ConsolePaths::DefaultAuthor => "default_author.pubkey",
-            ConsolePaths::History => "history",
-        }
-    }
-}
-impl FromStr for ConsolePaths {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self> {
-        Ok(match s {
-            "default_author.pubkey" => Self::DefaultAuthor,
-            "history" => Self::History,
-            _ => bail!("unknown file or directory"),
-        })
-    }
-}
-
-impl fmt::Display for ConsolePaths {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s: &str = self.into();
-        write!(f, "{s}")
-    }
-}
-impl AsRef<Path> for ConsolePaths {
-    fn as_ref(&self) -> &Path {
-        let s: &str = self.into();
-        Path::new(s)
-    }
-}
-
 impl ConsolePaths {
-    pub fn with_root(self, root: impl AsRef<Path>) -> PathBuf {
-        PathBuf::from(root.as_ref()).join(self)
+    fn root(iroh_data_dir: impl AsRef<Path>) -> PathBuf {
+        PathBuf::from(iroh_data_dir.as_ref()).join("console")
+    }
+    pub fn with_iroh_data_dir(self, iroh_data_dir: impl AsRef<Path>) -> PathBuf {
+        Self::root(iroh_data_dir).join(self.as_ref())
     }
 }
 
@@ -91,6 +57,7 @@ pub(crate) struct NodeConfig {
     pub(crate) gc_policy: GcPolicy,
     /// Bind address on which to serve Prometheus metrics
     pub(crate) metrics_addr: Option<SocketAddr>,
+    pub(crate) file_logs: super::logging::FileLogging,
 }
 
 impl Default for NodeConfig {
@@ -99,83 +66,39 @@ impl Default for NodeConfig {
             // TODO(ramfox): this should probably just be a relay map
             relay_nodes: [default_na_relay_node(), default_eu_relay_node()].into(),
             gc_policy: GcPolicy::Disabled,
-            metrics_addr: None,
+            metrics_addr: Some(([127, 0, 0, 1], 9090).into()),
+            file_logs: Default::default(),
         }
     }
 }
 
 impl NodeConfig {
-    /// Make a config from the default environment variables.
-    ///
-    /// Optionally provide an additional configuration source.
-    pub(crate) fn from_env(additional_config_source: Option<&Path>) -> anyhow::Result<Self> {
-        let config_path = iroh_config_path(CONFIG_FILE_NAME).context("invalid config path")?;
-        if let Some(path) = additional_config_source {
-            ensure!(
-                path.is_file(),
-                "Config file does not exist: {}",
-                path.display()
-            );
-        }
-        let sources = [Some(config_path.as_path()), additional_config_source];
-        let config = Self::load(
-            // potential config files
-            &sources,
-            // env var prefix for this config
-            ENV_PREFIX,
-            // map of present command line arguments
-            // args.make_overrides_map(),
-            HashMap::<String, String>::new(),
-        )?;
-        Ok(config)
-    }
+    /// Create a config using defaults, and the passed in config file.
+    pub async fn load(file: Option<&Path>) -> Result<NodeConfig> {
+        let default_config = iroh_config_path(CONFIG_FILE_NAME)?;
 
-    /// Make a config using a default, files, environment variables, and commandline flags.
-    ///
-    /// Later items in the *file_paths* slice will have a higher priority than earlier ones.
-    ///
-    /// Environment variables are expected to start with the *env_prefix*. Nested fields can be
-    /// accessed using `.`, if your environment allows env vars with `.`
-    ///
-    /// Note: For the metrics configuration env vars, it is recommended to use the metrics
-    /// specific prefix `IROH_METRICS` to set a field in the metrics config. You can use the
-    /// above dot notation to set a metrics field, eg, `IROH_CONFIG_METRICS.SERVICE_NAME`, but
-    /// only if your environment allows it
-    pub(crate) fn load<S, V>(
-        file_paths: &[Option<&Path>],
-        env_prefix: &str,
-        flag_overrides: HashMap<S, V>,
-    ) -> Result<NodeConfig>
-    where
-        S: AsRef<str>,
-        V: Into<Value>,
-    {
-        let mut builder = config::Config::builder();
-
-        // layer on config options from files
-        for path in file_paths.iter().flatten() {
-            if path.exists() {
-                let p = path.to_str().ok_or_else(|| anyhow::anyhow!("empty path"))?;
-                builder = builder.add_source(File::with_name(p));
+        let config_file = match file {
+            Some(file) => Some(file),
+            None => {
+                if default_config.exists() {
+                    Some(default_config.as_ref())
+                } else {
+                    None
+                }
             }
+        };
+        let mut config = if let Some(file) = config_file {
+            let config = tokio::fs::read_to_string(file).await?;
+            toml::from_str(&config)?
+        } else {
+            Self::default()
+        };
+
+        // override from env var
+        if let Some(env_filter) = env_file_rust_log().transpose()? {
+            config.file_logs.rust_log = env_filter;
         }
-
-        // next, add any environment variables
-        builder = builder.add_source(
-            Environment::with_prefix(env_prefix)
-                .separator("__")
-                .try_parsing(true),
-        );
-
-        // finally, override any values
-        for (flag, val) in flag_overrides.into_iter() {
-            builder = builder.set_override(flag, val)?;
-        }
-
-        let cfg = builder.build()?;
-        debug!("make_config:\n{:#?}\n", cfg);
-        let cfg = cfg.try_deserialize()?;
-        Ok(cfg)
+        Ok(config)
     }
 
     /// Constructs a `RelayMap` based on the current configuration.
@@ -199,7 +122,8 @@ pub(crate) struct ConsoleEnv(Arc<RwLock<ConsoleEnvInner>>);
 struct ConsoleEnvInner {
     /// Active author. Read from IROH_AUTHOR env variable.
     /// For console also read from/persisted to a file (see [`ConsolePaths::DefaultAuthor`])
-    author: Option<AuthorId>,
+    /// Defaults to the node's default author if both are empty.
+    author: AuthorId,
     /// Active doc. Read from IROH_DOC env variable. Not persisted.
     doc: Option<NamespaceId>,
     is_console: bool,
@@ -208,43 +132,51 @@ struct ConsoleEnvInner {
 
 impl ConsoleEnv {
     /// Read from environment variables and the console config file.
-    pub(crate) fn for_console(iroh_data_root: &Path) -> Result<Self> {
-        let author = match env_author()? {
-            Some(author) => Some(author),
-            None => Self::get_console_default_author(iroh_data_root)?,
-        };
+    pub(crate) async fn for_console(iroh_data_dir: PathBuf, iroh: &Iroh) -> Result<Self> {
+        let console_data_dir = ConsolePaths::root(&iroh_data_dir);
+        tokio::fs::create_dir_all(&console_data_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create console data directory at `{}`",
+                    console_data_dir.to_string_lossy()
+                )
+            })?;
+
+        Self::migrate_console_files_016_017(&iroh_data_dir).await?;
+
+        let configured_author = Self::get_console_default_author(&iroh_data_dir)?;
+        let author = env_author(configured_author, iroh).await?;
         let env = ConsoleEnvInner {
             author,
             doc: env_doc()?,
             is_console: true,
-            iroh_data_dir: iroh_data_root.to_path_buf(),
+            iroh_data_dir,
         };
         Ok(Self(Arc::new(RwLock::new(env))))
     }
 
     /// Read only from environment variables.
-    pub(crate) fn for_cli(iroh_data_root: &Path) -> Result<Self> {
+    pub(crate) async fn for_cli(iroh_data_dir: PathBuf, iroh: &Iroh) -> Result<Self> {
+        let author = env_author(None, iroh).await?;
         let env = ConsoleEnvInner {
-            author: env_author()?,
+            author,
             doc: env_doc()?,
             is_console: false,
-            iroh_data_dir: iroh_data_root.to_path_buf(),
+            iroh_data_dir,
         };
         Ok(Self(Arc::new(RwLock::new(env))))
     }
 
-    fn get_console_default_author(root: &Path) -> anyhow::Result<Option<AuthorId>> {
-        let author_path = ConsolePaths::DefaultAuthor.with_root(root);
-        if let Ok(s) = std::fs::read(&author_path) {
-            let author = String::from_utf8(s)
-                .map_err(Into::into)
-                .and_then(|s| AuthorId::from_str(&s))
-                .with_context(|| {
-                    format!(
-                        "Failed to parse author file at {}",
-                        author_path.to_string_lossy()
-                    )
-                })?;
+    fn get_console_default_author(iroh_data_root: &Path) -> anyhow::Result<Option<AuthorId>> {
+        let author_path = ConsolePaths::CurrentAuthor.with_iroh_data_dir(iroh_data_root);
+        if let Ok(s) = std::fs::read_to_string(&author_path) {
+            let author = AuthorId::from_str(&s).with_context(|| {
+                format!(
+                    "Failed to parse author file at {}",
+                    author_path.to_string_lossy()
+                )
+            })?;
             Ok(Some(author))
         } else {
             Ok(None)
@@ -266,12 +198,12 @@ impl ConsoleEnv {
     /// Will error if not running in the Iroh console.
     /// Will persist to a file in the Iroh data dir otherwise.
     pub(crate) fn set_author(&self, author: AuthorId) -> anyhow::Result<()> {
-        let author_path = ConsolePaths::DefaultAuthor.with_root(self.iroh_data_dir());
+        let author_path = ConsolePaths::CurrentAuthor.with_iroh_data_dir(self.iroh_data_dir());
         let mut inner = self.0.write();
         if !inner.is_console {
             bail!("Switching the author is only supported within the Iroh console, not on the command line");
         }
-        inner.author = Some(author);
+        inner.author = author;
         std::fs::write(author_path, author.to_string().as_bytes())?;
         Ok(())
     }
@@ -302,33 +234,78 @@ impl ConsoleEnv {
     }
 
     /// Get the active author.
-    pub(crate) fn author(&self, arg: Option<AuthorId>) -> anyhow::Result<AuthorId> {
+    ///
+    /// This is either the node's default author, or in the console optionally the author manually
+    /// switched to.
+    pub(crate) fn author(&self) -> AuthorId {
         let inner = self.0.read();
-        let author_id = arg.or(inner.author).ok_or_else(|| {
-            anyhow!(
-                "Missing author id. Set the active author with the `IROH_AUTHOR` environment variable or the `-a` option.\n\
-                In the console, you can also set the active author with `author switch`."
+        inner.author
+    }
+
+    pub(crate) async fn migrate_console_files_016_017(iroh_data_dir: &Path) -> Result<()> {
+        // In iroh up to 0.16, we stored console settings directly in the data directory. Starting
+        // from 0.17, they live in a subdirectory and have new paths.
+        let old_current_author = iroh_data_dir.join("default_author.pubkey");
+        if old_current_author.is_file() {
+            if let Err(err) = tokio::fs::rename(
+                &old_current_author,
+                ConsolePaths::CurrentAuthor.with_iroh_data_dir(iroh_data_dir),
             )
-        })?;
-        Ok(author_id)
+            .await
+            {
+                warn!(path=%old_current_author.to_string_lossy(), "failed to migrate the console's current author file: {err}");
+            }
+        }
+        let old_history = iroh_data_dir.join("history");
+        if old_history.is_file() {
+            if let Err(err) = tokio::fs::rename(
+                &old_history,
+                ConsolePaths::History.with_iroh_data_dir(iroh_data_dir),
+            )
+            .await
+            {
+                warn!(path=%old_history.to_string_lossy(), "failed to migrate the console's history file: {err}");
+            }
+        }
+        Ok(())
     }
 }
 
-fn env_author() -> Result<Option<AuthorId>> {
-    match env_var(ENV_AUTHOR) {
-        Ok(s) => Ok(Some(
-            AuthorId::from_str(&s).context("Failed to parse IROH_AUTHOR environment variable")?,
-        )),
-        Err(_) => Ok(None),
+async fn env_author(from_config: Option<AuthorId>, iroh: &Iroh) -> Result<AuthorId> {
+    if let Some(author) = env::var(ENV_AUTHOR)
+        .ok()
+        .map(|s| {
+            s.parse()
+                .context("Failed to parse IROH_AUTHOR environment variable")
+        })
+        .transpose()?
+        .or(from_config)
+    {
+        Ok(author)
+    } else {
+        iroh.authors().default().await
     }
 }
 
 fn env_doc() -> Result<Option<NamespaceId>> {
-    match env_var(ENV_DOC) {
-        Ok(s) => Ok(Some(
-            NamespaceId::from_str(&s).context("Failed to parse IROH_DOC environment variable")?,
-        )),
-        Err(_) => Ok(None),
+    env::var(ENV_DOC)
+        .ok()
+        .map(|s| {
+            s.parse()
+                .context("Failed to parse IROH_DOC environment variable")
+        })
+        .transpose()
+}
+
+/// Parse [`ENV_FILE_RUST_LOG`] as [`tracing_subscriber::EnvFilter`]. Returns `None` if not
+/// present.
+fn env_file_rust_log() -> Option<Result<crate::logging::EnvFilter>> {
+    match env::var(ENV_FILE_RUST_LOG) {
+        Ok(s) => Some(crate::logging::EnvFilter::from_str(&s).map_err(Into::into)),
+        Err(e) => match e {
+            env::VarError::NotPresent => None,
+            e @ env::VarError::NotUnicode(_) => Some(Err(e.into())),
+        },
     }
 }
 
@@ -347,7 +324,7 @@ const IROH_DIR: &str = "iroh";
 /// | macOS    | `$HOME`/Library/Application Support/iroh   | /Users/Alice/Library/Application Support/iroh |
 /// | Windows  | `{FOLDERID_RoamingAppData}`/iroh           | C:\Users\Alice\AppData\Roaming\iroh   |
 pub(crate) fn iroh_config_root() -> Result<PathBuf> {
-    if let Some(val) = env::var_os("IROH_CONFIG_DIR") {
+    if let Some(val) = env::var_os(ENV_CONFIG_DIR) {
         return Ok(PathBuf::from(val));
     }
     let cfg = dirs_next::config_dir()
@@ -422,9 +399,9 @@ pub(crate) fn iroh_cache_path(file_name: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_default_settings() {
-        let config = NodeConfig::load(&[][..], "__FOO", HashMap::<String, String>::new()).unwrap();
+    #[tokio::test]
+    async fn test_default_settings() {
+        let config = NodeConfig::load(None).await.unwrap();
 
         assert_eq!(config.relay_nodes.len(), 2);
     }

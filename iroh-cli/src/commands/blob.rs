@@ -8,27 +8,32 @@ use std::{
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Subcommand;
 use console::{style, Emoji};
-use futures::{Stream, StreamExt};
+use futures_lite::{Stream, StreamExt};
 use indicatif::{
     HumanBytes, HumanDuration, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState,
     ProgressStyle,
 };
-use iroh::bytes::{
-    get::{db::DownloadProgress, Stats},
-    provider::AddProgress,
-    store::{ConsistencyCheckProgress, ExportFormat, ExportMode, ReportLevel, ValidateProgress},
-    BlobFormat, Hash, HashAndFormat, Tag,
-};
-use iroh::net::{key::PublicKey, relay::RelayUrl, NodeAddr};
 use iroh::{
-    client::{BlobStatus, Iroh, ShareTicketOptions},
-    rpc_protocol::{
-        BlobDownloadRequest, BlobListCollectionsResponse, BlobListIncompleteResponse,
-        BlobListResponse, ProviderService, SetTagOption, WrapOption,
+    base::node_addr::AddrInfoOptions,
+    base::ticket::BlobTicket,
+    blobs::{
+        get::{db::DownloadProgress, progress::BlobProgress, Stats},
+        provider::AddProgress,
+        store::{
+            ConsistencyCheckProgress, ExportFormat, ExportMode, ReportLevel, ValidateProgress,
+        },
+        util::SetTagOption,
+        BlobFormat, Hash, HashAndFormat, Tag,
     },
-    ticket::BlobTicket,
+    client::{
+        blobs::{
+            BlobInfo, BlobStatus, CollectionInfo, DownloadMode, DownloadOptions,
+            IncompleteBlobInfo, WrapOption,
+        },
+        Iroh,
+    },
+    net::{key::PublicKey, relay::RelayUrl, NodeAddr},
 };
-use quic_rpc::ServiceConnection;
 use tokio::io::AsyncWriteExt;
 
 #[allow(clippy::large_enum_variant)]
@@ -81,6 +86,12 @@ pub enum BlobCommands {
         /// Tag to tag the data with.
         #[clap(long)]
         tag: Option<String>,
+        /// If set, will queue the download in the download queue.
+        ///
+        /// Use this if you are doing many downloads in parallel and want to limit the number of
+        /// downloads running concurrently.
+        #[clap(long)]
+        queued: bool,
     },
     /// Export a blob from the internal blob store to the local filesystem.
     Export {
@@ -135,9 +146,11 @@ pub enum BlobCommands {
     Share {
         /// Hash of the blob to share.
         hash: Hash,
-        /// Options to configure the generated ticket.
-        #[clap(long, default_value_t = ShareTicketOptions::RelayAndAddresses)]
-        ticket_options: ShareTicketOptions,
+        /// Options to configure the address information in the generated ticket.
+        ///
+        /// Use `relay-and-addresses` in networks with no internet connectivity.
+        #[clap(long, default_value_t = AddrInfoOptions::Id)]
+        addr_options: AddrInfoOptions,
         /// If the blob is a collection, the requester will also fetch the listed blobs.
         #[clap(long, default_value_t = false)]
         recursive: bool,
@@ -168,10 +181,7 @@ impl std::str::FromStr for TicketOrHash {
 }
 
 impl BlobCommands {
-    pub async fn run<C>(self, iroh: &Iroh<C>) -> Result<()>
-    where
-        C: ServiceConnection<ProviderService>,
-    {
+    pub async fn run(self, iroh: &Iroh) -> Result<()> {
         match self {
             Self::Get {
                 ticket,
@@ -183,6 +193,7 @@ impl BlobCommands {
                 out,
                 stable,
                 tag,
+                queued,
             } => {
                 let (node_addr, hash, format) = match ticket {
                     TicketOrHash::Ticket(ticket) => {
@@ -236,24 +247,27 @@ impl BlobCommands {
                     return Err(anyhow::anyhow!("The input arguments refer to a collection of blobs and output is set to STDOUT. Only single blobs may be passed in this case."));
                 }
 
-                if node_addr.info.is_empty() {
-                    return Err(anyhow::anyhow!(
-                        "no relay url provided and no direct addresses provided"
-                    ));
-                }
                 let tag = match tag {
                     Some(tag) => SetTagOption::Named(Tag::from(tag)),
                     None => SetTagOption::Auto,
                 };
 
+                let mode = match queued {
+                    true => DownloadMode::Queued,
+                    false => DownloadMode::Direct,
+                };
+
                 let mut stream = iroh
-                    .blobs
-                    .download(BlobDownloadRequest {
+                    .blobs()
+                    .download_with_opts(
                         hash,
-                        format,
-                        peer: node_addr,
-                        tag,
-                    })
+                        DownloadOptions {
+                            format,
+                            nodes: vec![node_addr],
+                            tag,
+                            mode,
+                        },
+                    )
                     .await?;
 
                 show_download_progress(hash, &mut stream).await?;
@@ -263,7 +277,7 @@ impl BlobCommands {
                     Some(OutputTarget::Stdout) => {
                         // we asserted above that `OutputTarget::Stdout` is only permitted if getting a
                         // single hash and not a hashseq.
-                        let mut blob_read = iroh.blobs.read(hash).await?;
+                        let mut blob_read = iroh.blobs().read(hash).await?;
                         tokio::io::copy(&mut blob_read, &mut tokio::io::stdout()).await?;
                     }
                     Some(OutputTarget::Path(path)) => {
@@ -281,7 +295,8 @@ impl BlobCommands {
                             false => ExportFormat::Blob,
                         };
                         tracing::info!("exporting to {} -> {}", path.display(), absolute.display());
-                        let stream = iroh.blobs.export(hash, absolute, format, mode).await?;
+                        let stream = iroh.blobs().export(hash, absolute, format, mode).await?;
+
                         // TODO: report export progress
                         stream.await?;
                     }
@@ -301,7 +316,7 @@ impl BlobCommands {
                             !recursive,
                             "Recursive option is not supported when exporting to STDOUT"
                         );
-                        let mut blob_read = iroh.blobs.read(hash).await?;
+                        let mut blob_read = iroh.blobs().read(hash).await?;
                         tokio::io::copy(&mut blob_read, &mut tokio::io::stdout()).await?;
                     }
                     OutputTarget::Path(path) => {
@@ -322,7 +337,7 @@ impl BlobCommands {
                             path.display(),
                             absolute.display()
                         );
-                        let stream = iroh.blobs.export(hash, absolute, format, mode).await?;
+                        let stream = iroh.blobs().export(hash, absolute, format, mode).await?;
                         // TODO: report export progress
                         stream.await?;
                     }
@@ -341,7 +356,7 @@ impl BlobCommands {
             } => add_with_opts(iroh, path, options).await,
             Self::Share {
                 hash,
-                ticket_options,
+                addr_options,
                 recursive,
                 debug,
             } => {
@@ -350,8 +365,8 @@ impl BlobCommands {
                 } else {
                     BlobFormat::Raw
                 };
-                let status = iroh.blobs.status(hash).await?;
-                let ticket = iroh.blobs.share(hash, format, ticket_options).await?;
+                let status = iroh.blobs().status(hash).await?;
+                let ticket = iroh.blobs().share(hash, format, addr_options).await?;
 
                 let (blob_status, size) = match (status, format) {
                     (BlobStatus::Complete { size }, BlobFormat::Raw) => ("blob", size),
@@ -428,29 +443,26 @@ pub enum ListCommands {
 }
 
 impl ListCommands {
-    pub async fn run<C>(self, iroh: &Iroh<C>) -> Result<()>
-    where
-        C: ServiceConnection<ProviderService>,
-    {
+    pub async fn run(self, iroh: &Iroh) -> Result<()> {
         match self {
             Self::Blobs => {
-                let mut response = iroh.blobs.list().await?;
+                let mut response = iroh.blobs().list().await?;
                 while let Some(item) = response.next().await {
-                    let BlobListResponse { path, hash, size } = item?;
+                    let BlobInfo { path, hash, size } = item?;
                     println!("{} {} ({})", path, hash, HumanBytes(size));
                 }
             }
             Self::IncompleteBlobs => {
-                let mut response = iroh.blobs.list_incomplete().await?;
+                let mut response = iroh.blobs().list_incomplete().await?;
                 while let Some(item) = response.next().await {
-                    let BlobListIncompleteResponse { hash, size, .. } = item?;
+                    let IncompleteBlobInfo { hash, size, .. } = item?;
                     println!("{} ({})", hash, HumanBytes(size));
                 }
             }
             Self::Collections => {
-                let mut response = iroh.blobs.list_collections().await?;
+                let mut response = iroh.blobs().list_collections()?;
                 while let Some(item) = response.next().await {
-                    let BlobListCollectionsResponse {
+                    let CollectionInfo {
                         tag,
                         hash,
                         total_blobs_count,
@@ -488,13 +500,10 @@ pub enum DeleteCommands {
 }
 
 impl DeleteCommands {
-    pub async fn run<C>(self, iroh: &Iroh<C>) -> Result<()>
-    where
-        C: ServiceConnection<ProviderService>,
-    {
+    pub async fn run(self, iroh: &Iroh) -> Result<()> {
         match self {
             Self::Blob { hash } => {
-                let response = iroh.blobs.delete_blob(hash).await;
+                let response = iroh.blobs().delete_blob(hash).await;
                 if let Err(e) = response {
                     eprintln!("Error: {}", e);
                 }
@@ -521,11 +530,8 @@ fn apply_report_level(text: String, level: ReportLevel) -> console::StyledObject
     }
 }
 
-pub async fn consistency_check<C>(iroh: &Iroh<C>, verbose: u8, repair: bool) -> Result<()>
-where
-    C: ServiceConnection<ProviderService>,
-{
-    let mut response = iroh.blobs.consistency_check(repair).await?;
+pub async fn consistency_check(iroh: &Iroh, verbose: u8, repair: bool) -> Result<()> {
+    let mut response = iroh.blobs().consistency_check(repair).await?;
     let verbosity = get_report_level(verbose);
     let print = |level: ReportLevel, entry: Option<Hash>, message: String| {
         if level < verbosity {
@@ -565,12 +571,9 @@ where
     Ok(())
 }
 
-pub async fn validate<C>(iroh: &Iroh<C>, verbose: u8, repair: bool) -> Result<()>
-where
-    C: ServiceConnection<ProviderService>,
-{
+pub async fn validate(iroh: &Iroh, verbose: u8, repair: bool) -> Result<()> {
     let mut state = ValidateProgressState::new();
-    let mut response = iroh.blobs.validate(repair).await?;
+    let mut response = iroh.blobs().validate(repair).await?;
     let verbosity = get_report_level(verbose);
     let print = |level: ReportLevel, entry: Option<Hash>, message: String| {
         if level < verbosity {
@@ -788,8 +791,8 @@ pub enum TicketOption {
     Print,
 }
 
-pub async fn add_with_opts<C: ServiceConnection<ProviderService>>(
-    client: &iroh::client::Iroh<C>,
+pub async fn add_with_opts(
+    client: &iroh::client::Iroh,
     source: BlobSource,
     opts: BlobAddOptions,
 ) -> Result<()> {
@@ -821,8 +824,8 @@ pub async fn add_with_opts<C: ServiceConnection<ProviderService>>(
 }
 
 /// Add data to iroh, either from a path or, if path is `None`, from STDIN.
-pub async fn add<C: ServiceConnection<ProviderService>>(
-    client: &iroh::client::Iroh<C>,
+pub async fn add(
+    client: &iroh::client::Iroh,
     source: BlobSourceIroh,
     tag: SetTagOption,
     ticket: TicketOption,
@@ -835,7 +838,7 @@ pub async fn add<C: ServiceConnection<ProviderService>>(
 
             // tell the node to add the data
             let stream = client
-                .blobs
+                .blobs()
                 .add_from_path(absolute, in_place, tag, wrap)
                 .await?;
             aggregate_add_response(stream).await?
@@ -853,7 +856,7 @@ pub async fn add<C: ServiceConnection<ProviderService>>(
 
             // tell the node to add the data
             let stream = client
-                .blobs
+                .blobs()
                 .add_from_path(path_buf, false, tag, wrap)
                 .await?;
             aggregate_add_response(stream).await?
@@ -862,7 +865,7 @@ pub async fn add<C: ServiceConnection<ProviderService>>(
 
     print_add_response(hash, format, entries);
     if let TicketOption::Print = ticket {
-        let status = client.node.status().await?;
+        let status = client.status().await?;
         let ticket = BlobTicket::new(status.addr, hash, format)?;
         println!("All-in-one ticket: {ticket}");
     }
@@ -1014,6 +1017,36 @@ pub async fn show_download_progress(
     let mut seq = false;
     while let Some(x) = stream.next().await {
         match x? {
+            DownloadProgress::InitialState(state) => {
+                if state.connected {
+                    op.set_message(format!("{} Requesting ...\n", style("[2/3]").bold().dim()));
+                }
+                if let Some(count) = state.root.child_count {
+                    op.set_message(format!(
+                        "{} Downloading {} blob(s)\n",
+                        style("[3/3]").bold().dim(),
+                        count + 1,
+                    ));
+                    op.set_length(count + 1);
+                    op.reset();
+                    op.set_position(state.current.map(u64::from).unwrap_or(0));
+                    seq = true;
+                }
+                if let Some(blob) = state.get_current() {
+                    if let Some(size) = blob.size {
+                        ip.set_length(size.value());
+                        ip.reset();
+                        match blob.progress {
+                            BlobProgress::Pending => {}
+                            BlobProgress::Progressing(offset) => ip.set_position(offset),
+                            BlobProgress::Done => ip.finish_and_clear(),
+                        }
+                        if !seq {
+                            op.finish_and_clear();
+                        }
+                    }
+                }
+            }
             DownloadProgress::FoundLocal { .. } => {}
             DownloadProgress::Connected => {
                 op.set_message(format!("{} Requesting ...\n", style("[2/3]").bold().dim()));
@@ -1030,7 +1063,7 @@ pub async fn show_download_progress(
             }
             DownloadProgress::Found { size, child, .. } => {
                 if seq {
-                    op.set_position(child);
+                    op.set_position(child.into());
                 } else {
                     op.finish_and_clear();
                 }
@@ -1058,7 +1091,7 @@ pub async fn show_download_progress(
                 break;
             }
             DownloadProgress::Abort(e) => {
-                bail!("download aborted: {:?}", e);
+                bail!("download aborted: {}", e);
             }
         }
     }

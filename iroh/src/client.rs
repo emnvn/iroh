@@ -1,58 +1,67 @@
-//! Client to an iroh node. Is generic over the connection (in-memory or RPC).
-//!
-//! TODO: Contains only iroh sync related methods. Add other methods.
+//! Client to an Iroh node.
 
-use futures::{Stream, StreamExt};
-use quic_rpc::{RpcClient, ServiceConnection};
+use futures_lite::{Stream, StreamExt};
+use ref_cast::RefCast;
 
-use crate::rpc_protocol::ProviderService;
+#[doc(inline)]
+pub use crate::rpc_protocol::RpcService;
 
-pub mod mem;
-pub mod quic;
+mod quic;
 
-mod authors;
-mod blobs;
-mod docs;
+#[deprecated]
+pub use self::docs::Doc as MemDoc;
+#[deprecated]
+pub use self::docs::Doc as QuicDoc;
+pub use self::docs::Doc;
+pub use self::node::NodeStatus;
+#[deprecated]
+pub use self::Iroh as MemIroh;
+#[deprecated]
+pub use self::Iroh as QuicIroh;
+
+pub(crate) use self::quic::{connect_raw as quic_connect_raw, RPC_ALPN};
+
+pub mod authors;
+pub mod blobs;
+pub mod docs;
+pub mod tags;
+
 mod node;
-mod tags;
 
-pub use self::authors::Client as AuthorsClient;
-pub use self::blobs::{
-    BlobAddOutcome, BlobAddProgress, BlobDownloadOutcome, BlobDownloadProgress, BlobReader,
-    BlobStatus, Client as BlobsClient, ShareTicketOptions,
-};
-pub use self::docs::{Client as DocsClient, Doc, Entry, LiveEvent};
-pub use self::node::Client as NodeClient;
-pub use self::tags::Client as TagsClient;
+/// Iroh rpc client - boxed so that we can have a concrete type.
+pub(crate) type RpcClient =
+    quic_rpc::RpcClient<RpcService, quic_rpc::transport::boxed::Connection<RpcService>>;
 
-/// Iroh client
+/// Iroh client.
 #[derive(Debug, Clone)]
-pub struct Iroh<C> {
-    /// Client for node operations.
-    pub node: NodeClient<C>,
-    /// Client for blobs operations.
-    pub blobs: BlobsClient<C>,
-    /// Client for docs operations.
-    pub docs: DocsClient<C>,
-    /// Client for author operations.
-    pub authors: AuthorsClient<C>,
-    /// Client for tags operations.
-    pub tags: TagsClient<C>,
+pub struct Iroh {
+    rpc: RpcClient,
 }
 
-impl<C> Iroh<C>
-where
-    C: ServiceConnection<ProviderService>,
-{
+impl Iroh {
     /// Create a new high-level client to a Iroh node from the low-level RPC client.
-    pub fn new(rpc: RpcClient<ProviderService, C>) -> Self {
-        Self {
-            node: NodeClient { rpc: rpc.clone() },
-            blobs: BlobsClient { rpc: rpc.clone() },
-            docs: DocsClient { rpc: rpc.clone() },
-            authors: AuthorsClient { rpc: rpc.clone() },
-            tags: TagsClient { rpc },
-        }
+    pub fn new(rpc: RpcClient) -> Self {
+        Self { rpc }
+    }
+
+    /// Blobs client
+    pub fn blobs(&self) -> &blobs::Client {
+        blobs::Client::ref_cast(&self.rpc)
+    }
+
+    /// Docs client
+    pub fn docs(&self) -> &docs::Client {
+        docs::Client::ref_cast(&self.rpc)
+    }
+
+    /// Authors client
+    pub fn authors(&self) -> &authors::Client {
+        authors::Client::ref_cast(&self.rpc)
+    }
+
+    /// Tags client
+    pub fn tags(&self) -> &tags::Client {
+        tags::Client::ref_cast(&self.rpc)
     }
 }
 
