@@ -17,12 +17,14 @@ use tokio::{
     sync::{broadcast, mpsc, oneshot},
     task::JoinHandle,
 };
-use tracing::{debug, error_span, trace, warn, Instrument};
+use tracing::{debug, error_span, info, trace, warn, Instrument};
 
 use self::util::{read_message, write_message, Timers};
 use crate::proto::{self, PeerData, Scope, TopicId};
+use std::env;
 
 pub mod util;
+
 
 /// ALPN protocol name
 pub const GOSSIP_ALPN: &[u8] = b"/iroh-gossip/0";
@@ -89,9 +91,21 @@ impl Gossip {
             config,
             rand::rngs::StdRng::from_entropy(),
         );
-        let (to_actor_tx, to_actor_rx) = mpsc::channel(TO_ACTOR_CAP);
-        let (in_event_tx, in_event_rx) = mpsc::channel(IN_EVENT_CAP);
-        let (on_endpoints_tx, on_endpoints_rx) = mpsc::channel(ON_ENDPOINTS_CAP);
+
+        let  to_actor_cap = util::get_usize_env_or_default("EM_TO_ACTOR_CAP".to_owned(), TO_ACTOR_CAP);
+        trace!("emnvn TO_ACTOR_CAP value: {:?}",to_actor_cap);
+
+        let  in_event_cap = util::get_usize_env_or_default("EM_IN_EVENT_CAP".to_owned(), IN_EVENT_CAP);
+        trace!("emnvn EM_IN_EVENT_CAP value: {:?}",in_event_cap);
+
+
+        let  on_endpoints_cap = util::get_usize_env_or_default("EM_ON_ENDPOINTS_CAP".to_owned(), ON_ENDPOINTS_CAP);
+        trace!("emnvn ON_ENDPOINTS_CAP value: {:?}",on_endpoints_cap);
+
+
+        let (to_actor_tx, to_actor_rx) = mpsc::channel(to_actor_cap);
+        let (in_event_tx, in_event_rx) = mpsc::channel(in_event_cap);
+        let (on_endpoints_tx, on_endpoints_rx) = mpsc::channel(on_endpoints_cap);
 
         let me = endpoint.node_id().fmt_short();
         let max_message_size = state.max_message_size();
@@ -438,7 +452,13 @@ impl Actor {
             ToActor::ConnIncoming(peer_id, origin, conn) => {
                 self.conns.insert(peer_id, conn.clone());
                 self.dialer.abort_dial(&peer_id);
-                let (send_tx, send_rx) = mpsc::channel(SEND_QUEUE_CAP);
+                let  send_queue_cap = util::get_usize_env_or_default("EM_SEND_QUEUE_CAP".to_owned(), SEND_QUEUE_CAP);
+
+                trace!("emnvn SEND_QUEUE_CAP value: {:?}",send_queue_cap);
+             
+
+               let (send_tx, send_rx) = mpsc::channel(send_queue_cap);
+             //  let (send_tx, send_rx) = mpsc::channel();
                 self.conn_send_tx.insert(peer_id, send_tx.clone());
 
                 let max_message_size = self.state.max_message_size();
@@ -598,7 +618,12 @@ impl Actor {
         if let Some(tx) = self.subscribers_all.as_mut() {
             tx.subscribe()
         } else {
-            let (tx, rx) = broadcast::channel(SUBSCRIBE_ALL_CAP);
+
+            let  subscribe_all_cab = util::get_usize_env_or_default("EM_SUBSCRIBE_ALL_CAP".to_owned(), SUBSCRIBE_ALL_CAP);
+          
+            trace!("emnvn SUBSCRIBE_ALL_CAP value: {:?}",subscribe_all_cab);
+         
+            let (tx, rx) = broadcast::channel(subscribe_all_cab);
             self.subscribers_all = Some(tx);
             rx
         }
@@ -608,7 +633,9 @@ impl Actor {
         if let Some(tx) = self.subscribers_topic.get(&topic_id) {
             tx.subscribe()
         } else {
-            let (tx, rx) = broadcast::channel(SUBSCRIBE_TOPIC_CAP);
+            let  subscribe_topic_cab = util::get_usize_env_or_default("EM_SUBSCRIBE_TOPIC_CAP".to_owned(), SUBSCRIBE_TOPIC_CAP);
+            trace!("emnvn SUBSCRIBE_TOPIC_CAP value: {:?}",subscribe_topic_cab);
+            let (tx, rx) = broadcast::channel(subscribe_topic_cab);
             self.subscribers_topic.insert(topic_id, tx);
             rx
         }

@@ -12,7 +12,17 @@ use tokio::{
 use crate::proto::util::TimerMap;
 
 use super::ProtoMessage;
+use std::env;
 
+/// Get setting SUBSCRIBE_ALL_CAP, SUBSCRIBE_TOPIC_CAP,.. from env or default from code
+pub fn get_usize_env_or_default(env_name: String, default: usize) -> usize {
+    if let Ok(value) = env::var(env_name) {
+        return value.parse::<usize>().unwrap();    
+    }
+
+    return default;
+
+}
 /// Write a `ProtoMessage` as a length-prefixed, postcard-encoded message.
 pub async fn write_message<W: AsyncWrite + Unpin>(
     writer: &mut W,
