@@ -899,12 +899,19 @@ impl Endpoint {
 }
 
 /// Future produced by [`Endpoint::accept`].
-#[derive(Debug)]
 #[pin_project::pin_project]
 pub struct Accept<'a> {
     #[pin]
     inner: quinn::Accept<'a>,
     magic_ep: Endpoint,
+}
+
+impl<'a> std::fmt::Debug for Accept<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Accept")
+            .field("magic_ep", &self.magic_ep)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> Future for Accept<'a> {
